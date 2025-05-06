@@ -3,28 +3,32 @@ import re
 import logging
 import ssl
 import yt_dlp
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
+    Application, CommandHandler, MessageHandler,
     ContextTypes, filters
 )
 
-# Patch SSL
+# SSL bypass for yt-dlp
 ssl._create_default_https_context = ssl._create_unverified_context
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN")
+# Load from env or use placeholders
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+APP_URL = os.getenv("RENDER_EXTERNAL_URL")  # Render auto-injects this
 
+# Check URL validity
 def is_valid_url(text):
     return re.match(r'https?://', text)
 
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send any video link (YouTube, TikTok, Facebook, Instagram, etc.)")
+    await update.message.reply_text("👋 Send any video link (YouTube, TikTok, Facebook, etc.)")
 
-# Video handler
+# Download and reply with video
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
@@ -42,8 +46,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'noplaylist': True,
         'geo_bypass': True,
         'nocheckcertificate': True,
-        'concurrent_fragment_downloads': 10,
-        'retries': 5,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
         },
@@ -65,11 +67,31 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logging.error(f"Failed to download: {e}")
-        await update.message.reply_text("❌ Failed to download. This might be a private, region-locked, or invalid link.")
+        await update.message.reply_text("❌ Failed to download. The link may be unsupported or blocked.")
 
-# Main runner
+# Telegram Webhook handler
+async def telegram_webhook(request):
+    data = await request.json()
+    update = Update.de_json(data, app.bot)
+    await app.process_update(update)
+    return web.Response()
+
+# Create app and register webhook
+app = Application.builder().token(BOT_TOKEN).build()
+app.add_handler(CommandHandler("start", start))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
+
+# Aiohttp web server setup
+web_app = web.Application()
+web_app.router.add_post("/webhook", telegram_webhook)
+
+async def on_startup(app_):
+    webhook_url = f"{APP_URL}/webhook"
+    await app.bot.set_webhook(webhook_url)
+    print(f"🔗 Webhook set to: {webhook_url}")
+
+web_app.on_startup.append(on_startup)
+
+# Run aiohttp server on port 10000
 if __name__ == "__main__":
-    app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
-    app.run_polling()
+    web.run_app(web_app, port=10000)
