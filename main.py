@@ -1,74 +1,79 @@
 import os
-import logging
 import ssl
 import re
+import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 import yt_dlp
 
-# Set up SSL context to avoid CERTIFICATE_VERIFY_FAILED
+# Avoid SSL errors
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# Enable logging
+# Logging setup
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 
-# Get token from environment
 TOKEN = os.getenv("BOT_TOKEN")
 
-# URL validation function
-def is_valid_url(url: str) -> bool:
-    return re.match(r'https?://', url) is not None
+# URL checker
+def is_valid_url(url):
+    return re.match(r'https?://', url)
 
 # Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Hello! Send me any social media video link (YouTube, TikTok, Instagram, Twitter, Facebook) and I’ll download it for you."
-    )
+    await update.message.reply_text("👋 Send me any social media video link and I’ll download it for you.")
 
-# Handle video links
+# Main handler
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
     if not is_valid_url(url):
-        await update.message.reply_text("❌ That doesn't look like a valid link. Please send a valid video URL.")
+        await update.message.reply_text("❌ That doesn't look like a valid link.")
         return
 
-    await update.message.reply_text("📥 Downloading video, please wait...")
+    await update.message.reply_text("📥 Downloading... please wait.")
 
     ydl_opts = {
-        'outtmpl': 'downloaded.%(ext)s',
-        'format': 'best[ext=mp4]/best',
-        'quiet': True,
-        'nocheckcertificate': True,
+        'outtmpl': 'video.%(ext)s',
+        'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
+        'quiet': True,
         'noplaylist': True,
+        'nocheckcertificate': True,
         'geo_bypass': True,
         'source_address': '0.0.0.0',
+        'retries': 3,
+        'concurrent_fragment_downloads': 5,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0',
+        },
         'no_color': True,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            file_name = ydl.prepare_filename(info)
+            file_path = ydl.prepare_filename(info)
 
-        # Send the video back to user
-        with open(file_name, 'rb') as video:
+        with open(file_path, 'rb') as video:
             await update.message.reply_video(video=video, caption="✅ Here's your video!")
 
-        os.remove(file_name)
+        os.remove(file_path)
 
     except Exception as e:
-        logging.error(f"Download error: {e}")
-        await update.message.reply_text("❌ Failed to download the video. Try another link or check the URL.")
+        logging.error(f"Download failed: {e}")
+        await update.message.reply_text("❌ Couldn't download the video. Try another link or wait a bit.")
 
-# Start bot
+# App init
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
-    print("Bot is running...")
-    app.run_polling()
+
+    logging.info("Bot running...")
+
+    # Background worker mode for Render
+    import asyncio
+    asyncio.run(app.run_polling())
