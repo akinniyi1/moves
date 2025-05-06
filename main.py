@@ -1,110 +1,96 @@
 import os
 import logging
-import subprocess
-import uuid
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import yt_dlp
+import aiohttp
+import ffmpeg
+import tempfile
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 
-# Logging setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Progress Hook
+def progress_hook(d):
+    if d['status'] == 'downloading':
+        percent = d.get('_percent_str', '').strip()
+        speed = d.get('_speed_str', '').strip()
+        eta = d.get('eta', '')
+        logging.info(f"Downloading: {percent} at {speed} ETA: {eta}s")
 
-# Create downloads folder
-DOWNLOAD_DIR = "downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-
-# Command handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"👋 Hi {update.effective_user.first_name}! Send me any video or photo link to download it.\n\nFor videos, you can also extract audio after download!")
+    await update.message.reply_text("👋 Welcome! Send me a video or photo link to download.")
 
-# Process video/photo links
-async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    user_id = update.effective_user.id
-    logger.info(f"[{user_id}] Requested: {url}")
 
-    if not url.startswith("http"):
-        await update.message.reply_text("❗️Please send a valid media link.")
-        return
+    temp_dir = tempfile.mkdtemp()
+    ydl_opts = {
+        'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
+        'format': 'bestvideo+bestaudio/best',
+        'progress_hooks': [progress_hook],
+        'quiet': True,
+    }
 
-    # Create a unique filename
-    file_id = str(uuid.uuid4())
-    output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
-
-    # Try photo first
     try:
-        if any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
-            photo_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.jpg")
-            subprocess.run(["wget", "-O", photo_path, url], check=True)
-            await update.message.reply_photo(photo=open(photo_path, "rb"))
-            os.remove(photo_path)
-            return
-    except Exception as e:
-        logger.warning(f"Image download failed: {e}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_path = ydl.prepare_filename(info)
 
-    # Otherwise, try video
-    try:
-        await update.message.reply_text("⏬ Downloading video, please wait...")
-        result = subprocess.run([
-            "yt-dlp",
-            "-o", output_path,
-            url
-        ], capture_output=True, text=True)
+        with open(file_path, 'rb') as f:
+            sent_msg = await update.message.reply_video(video=f, caption="✅ Video downloaded!")
 
-        if result.returncode != 0:
-            raise Exception(result.stderr)
-
-        # Find downloaded file
-        for fname in os.listdir(DOWNLOAD_DIR):
-            if fname.startswith(file_id) and not fname.endswith(".part"):
-                video_path = os.path.join(DOWNLOAD_DIR, fname)
-                break
-        else:
-            raise Exception("No video file found.")
-
-        with open(video_path, "rb") as f:
-            keyboard = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"audio|{video_path}")
-            ]])
-            await update.message.reply_video(f, caption="✅ Video downloaded.", reply_markup=keyboard)
+        # Inline button to convert to audio
+        keyboard = [
+            [InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio|{file_path}")]
+        ]
+        await update.message.reply_text("Choose an action:", reply_markup=InlineKeyboardMarkup(keyboard))
 
     except Exception as e:
-        logger.error(f"Video download error: {e}")
-        await update.message.reply_text(f"❌ Error downloading: {e}")
+        await update.message.reply_text(f"❌ Error: {str(e)}")
 
-# Handle inline button callback to convert video to audio
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_audio_convert(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    data = query.data.split("|")
+    if data[0] != "audio":
+        return
 
-    data = query.data
-    if data.startswith("audio|"):
-        video_path = data.split("|", 1)[1]
-        audio_path = video_path.rsplit(".", 1)[0] + ".mp3"
+    file_path = data[1]
+    audio_path = file_path.rsplit(".", 1)[0] + ".mp3"
 
-        try:
-            subprocess.run([
-                "ffmpeg", "-i", video_path,
-                "-vn", "-ab", "192k", "-ar", "44100",
-                "-y", audio_path
-            ], check=True)
+    try:
+        (
+            ffmpeg
+            .input(file_path)
+            .output(audio_path, format='mp3', acodec='libmp3lame')
+            .run(quiet=True, overwrite_output=True)
+        )
 
-            with open(audio_path, "rb") as f:
-                await query.message.reply_audio(f, caption="🎧 Here is your audio!")
-        except Exception as e:
-            logger.error(f"Audio conversion error: {e}")
-            await query.message.reply_text("❌ Failed to convert to audio.")
+        with open(audio_path, 'rb') as f:
+            await query.message.reply_audio(audio=f, caption="🎧 Audio version")
 
-# Run the bot
+    except Exception as e:
+        await query.message.reply_text(f"❌ Audio conversion failed: {str(e)}")
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    file_path = os.path.join(tempfile.mkdtemp(), "photo.jpg")
+    await file.download_to_drive(file_path)
+
+    with open(file_path, "rb") as f:
+        await update.message.reply_photo(photo=f, caption="✅ Photo downloaded!")
+
 if __name__ == "__main__":
-    TOKEN = os.getenv("BOT_TOKEN")  # Set this in your environment or .env file
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_handler))
-    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(CallbackQueryHandler(handle_audio_convert))
 
     app.run_polling()
