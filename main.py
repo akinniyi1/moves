@@ -1,7 +1,7 @@
 import os
 import re
-import logging
 import ssl
+import logging
 import yt_dlp
 from aiohttp import web
 from telegram import Update
@@ -10,25 +10,28 @@ from telegram.ext import (
     ContextTypes, filters
 )
 
-# SSL bypass for yt-dlp
+# Bypass SSL verification (fixes yt-dlp cert errors)
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# Logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 
-# Load from env or use placeholders
+# Environment vars
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL")  # Render auto-injects this
+APP_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# Check URL validity
+# Create app object
+application = Application.builder().token(BOT_TOKEN).build()
+
+# Simple URL validator
 def is_valid_url(text):
     return re.match(r'https?://', text)
 
-# Start command
+# /start handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Send any video link (YouTube, TikTok, Facebook, etc.)")
+    await update.message.reply_text("👋 Send me any video link and I'll download it for you!")
 
-# Download and reply with video
+# Video handler
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
@@ -58,40 +61,52 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            file_path = ydl.prepare_filename(info)
+            filename = ydl.prepare_filename(info)
 
-        with open(file_path, 'rb') as f:
-            await update.message.reply_video(video=f, caption="✅ Here's your video!")
+        with open(filename, 'rb') as f:
+            await update.message.reply_video(video=f, caption="✅ Done!")
 
-        os.remove(file_path)
+        os.remove(filename)
 
     except Exception as e:
-        logging.error(f"Failed to download: {e}")
-        await update.message.reply_text("❌ Failed to download. The link may be unsupported or blocked.")
+        logging.error(f"Download failed: {e}")
+        await update.message.reply_text("❌ Could not download this video.")
 
-# Telegram Webhook handler
-async def telegram_webhook(request):
-    data = await request.json()
-    update = Update.de_json(data, app.bot)
-    await app.process_update(update)
-    return web.Response()
+# Register handlers
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
 
-# Create app and register webhook
-app = Application.builder().token(BOT_TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
-
-# Aiohttp web server setup
+# aiohttp server
 web_app = web.Application()
-web_app.router.add_post("/webhook", telegram_webhook)
 
-async def on_startup(app_):
+# Route POST /webhook
+async def webhook_handler(request):
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.update_queue.put(update)
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+    return web.Response(text="ok")
+
+web_app.router.add_post("/webhook", webhook_handler)
+
+# Start-up logic: set webhook and initialize app
+async def on_startup(app):
+    await application.initialize()
+    await application.start()
     webhook_url = f"{APP_URL}/webhook"
-    await app.bot.set_webhook(webhook_url)
-    print(f"🔗 Webhook set to: {webhook_url}")
+    await application.bot.set_webhook(webhook_url)
+    logging.info(f"✅ Webhook set: {webhook_url}")
+
+# Shutdown logic
+async def on_cleanup(app):
+    await application.stop()
+    await application.shutdown()
 
 web_app.on_startup.append(on_startup)
+web_app.on_cleanup.append(on_cleanup)
 
-# Run aiohttp server on port 10000
+# Run aiohttp app on port 10000
 if __name__ == "__main__":
     web.run_app(web_app, port=10000)
