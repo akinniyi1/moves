@@ -1,144 +1,110 @@
 import os
-import re
-import ssl
 import logging
-import yt_dlp
-from aiohttp import web
-from telegram import Update
+import subprocess
+import uuid
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    ContextTypes, filters
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
 )
-
-# Bypass SSL verification (fixes yt-dlp cert errors)
-ssl._create_default_https_context = ssl._create_unverified_context
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Environment vars
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL")
+# Create downloads folder
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-application = Application.builder().token(BOT_TOKEN).build()
-
-
-def is_valid_url(text):
-    return re.match(r'https?://', text)
-
-
-# /start handler
+# Command handler
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.effective_user.first_name or "there"
-    await update.message.reply_text(f"👋 Hello {name}! Send me any video link and I’ll download it for you.")
+    await update.message.reply_text(f"👋 Hi {update.effective_user.first_name}! Send me any video or photo link to download it.\n\nFor videos, you can also extract audio after download!")
 
-
-# Main download handler
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Process video/photo links
+async def download_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    user = update.effective_user
-    name = user.first_name or "friend"
+    user_id = update.effective_user.id
+    logger.info(f"[{user_id}] Requested: {url}")
 
-    if not is_valid_url(url):
-        await update.message.reply_text("❌ That doesn't look like a valid video link.")
+    if not url.startswith("http"):
+        await update.message.reply_text("❗️Please send a valid media link.")
         return
 
-    # Send initial message
-    status_msg = await update.message.reply_text(f"📥 Hi {name}, starting your download...")
+    # Create a unique filename
+    file_id = str(uuid.uuid4())
+    output_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.%(ext)s")
 
-    filename = "video.mp4"
-
-    # Track last percentage to avoid spam
-    progress_state = {'last_percent': 0}
-
-    def progress_hook(d):
-        if d['status'] == 'downloading':
-            total = d.get('_total_bytes_estimate') or d.get('total_bytes') or 0
-            downloaded = d.get('downloaded_bytes') or 0
-            if total > 0:
-                percent = int(downloaded * 100 / total)
-                if percent - progress_state['last_percent'] >= 10:
-                    progress_state['last_percent'] = percent
-                    # Send progress update
-                    context.application.create_task(
-                        status_msg.edit_text(f"📦 Downloading... {percent}%")
-                    )
-
-    ydl_opts = {
-        'progress_hooks': [progress_hook],
-        'outtmpl': filename,
-        'format': 'bestvideo+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'noplaylist': True,
-        'quiet': True,
-        'geo_bypass': True,
-        'nocheckcertificate': True,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        },
-        'postprocessors': [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4'
-        }]
-    }
-
+    # Try photo first
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        if any(url.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.webp']):
+            photo_path = os.path.join(DOWNLOAD_DIR, f"{file_id}.jpg")
+            subprocess.run(["wget", "-O", photo_path, url], check=True)
+            await update.message.reply_photo(photo=open(photo_path, "rb"))
+            os.remove(photo_path)
+            return
+    except Exception as e:
+        logger.warning(f"Image download failed: {e}")
 
-        # Final progress update
-        await status_msg.edit_text("✅ Download complete. Sending video...")
+    # Otherwise, try video
+    try:
+        await update.message.reply_text("⏬ Downloading video, please wait...")
+        result = subprocess.run([
+            "yt-dlp",
+            "-o", output_path,
+            url
+        ], capture_output=True, text=True)
 
-        with open(filename, 'rb') as f:
-            await update.message.reply_video(video=f, caption="🎉 Here is your video!")
+        if result.returncode != 0:
+            raise Exception(result.stderr)
 
-        os.remove(filename)
+        # Find downloaded file
+        for fname in os.listdir(DOWNLOAD_DIR):
+            if fname.startswith(file_id) and not fname.endswith(".part"):
+                video_path = os.path.join(DOWNLOAD_DIR, fname)
+                break
+        else:
+            raise Exception("No video file found.")
+
+        with open(video_path, "rb") as f:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"audio|{video_path}")
+            ]])
+            await update.message.reply_video(f, caption="✅ Video downloaded.", reply_markup=keyboard)
 
     except Exception as e:
-        logging.error(f"Download failed: {e}")
-        await status_msg.edit_text("❌ Failed to download this video.")
+        logger.error(f"Video download error: {e}")
+        await update.message.reply_text(f"❌ Error downloading: {e}")
 
+# Handle inline button callback to convert video to audio
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-# Register handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
+    data = query.data
+    if data.startswith("audio|"):
+        video_path = data.split("|", 1)[1]
+        audio_path = video_path.rsplit(".", 1)[0] + ".mp3"
 
-# aiohttp app
-web_app = web.Application()
+        try:
+            subprocess.run([
+                "ffmpeg", "-i", video_path,
+                "-vn", "-ab", "192k", "-ar", "44100",
+                "-y", audio_path
+            ], check=True)
 
+            with open(audio_path, "rb") as f:
+                await query.message.reply_audio(f, caption="🎧 Here is your audio!")
+        except Exception as e:
+            logger.error(f"Audio conversion error: {e}")
+            await query.message.reply_text("❌ Failed to convert to audio.")
 
-# Webhook route
-async def webhook_handler(request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.update_queue.put(update)
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-    return web.Response(text="ok")
-
-
-web_app.router.add_post("/webhook", webhook_handler)
-
-
-# Startup and shutdown logic
-async def on_startup(app):
-    await application.initialize()
-    await application.start()
-    webhook_url = f"{APP_URL}/webhook"
-    await application.bot.set_webhook(webhook_url)
-    logging.info(f"✅ Webhook set: {webhook_url}")
-
-
-async def on_cleanup(app):
-    await application.stop()
-    await application.shutdown()
-
-
-web_app.on_startup.append(on_startup)
-web_app.on_cleanup.append(on_cleanup)
-
-
-# Run aiohttp on Render (port 10000)
+# Run the bot
 if __name__ == "__main__":
-    web.run_app(web_app, port=10000)
+    TOKEN = os.getenv("BOT_TOKEN")  # Set this in your environment or .env file
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_handler))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    app.run_polling()
