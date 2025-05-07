@@ -42,7 +42,7 @@ def is_image_url(url):
     if url.lower().endswith(image_ext):
         return True
     try:
-        head = requests.head(url, timeout=5, allow_redirects=True)
+        head = requests.head(url, timeout=5)
         return head.headers.get("Content-Type", "").startswith("image/")
     except:
         return False
@@ -110,17 +110,38 @@ def increment_download(user_data):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.effective_user.first_name or "there"
-    await update.message.reply_text(f"👋 Hello {name}! Send me any video or image link and I’ll download it for you.")
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 View Profile", callback_data="view_profile")]
+    ])
+    await update.message.reply_text(
+        f"👋 Hello {name}! Send me any video or image link and I’ll download it for you.",
+        reply_markup=keyboard
+    )
 
 async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     data = get_user_data(user.id, user.first_name)
     plan = "Premium ✅" if is_premium(data) else "Free 🆓"
     downloads = data.get("downloads_today", 0)
-    text = f"👤 Name: {data['name']}\n📋 Plan: {plan}"
-    if not is_premium(data):
-        text += f"\n📥 Downloads Today: {downloads}/3"
-    await update.message.reply_text(text)
+    await update.message.reply_text(
+        f"👤 Name: {data['name']}\n📋 Plan: {plan}\n📥 Downloads Today: {downloads}/3" if plan == "Free 🆓" else f"👤 Name: {data['name']}\n📋 Plan: {plan}"
+    )
+
+async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "view_profile":
+        user = query.from_user
+        data = get_user_data(user.id, user.first_name)
+        plan = "Premium ✅" if is_premium(data) else "Free 🆓"
+        downloads = data.get("downloads_today", 0)
+        message = (
+            f"👤 Name: {data['name']}\n📋 Plan: {plan}\n📥 Downloads Today: {downloads}/3"
+            if plan == "Free 🆓" else
+            f"👤 Name: {data['name']}\n📋 Plan: {plan}"
+        )
+        await query.edit_message_text(message)
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -147,18 +168,20 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     user = update.effective_user
     name = user.first_name or "friend"
+
     user_data = get_user_data(user.id, name)
 
     if not can_download(user_data):
-        return await update.message.reply_text("⚠️ You’ve reached your daily limit of 3 downloads. Come back tomorrow.")
+        await update.message.reply_text("⚠️ You’ve reached your daily limit of 3 downloads. Come back tomorrow.")
+        return
 
     if not is_valid_url(url):
-        return await update.message.reply_text("❌ That doesn't look like a valid link.")
+        await update.message.reply_text("❌ That doesn't look like a valid link.")
+        return
 
-    # --- Handle image ---
     if is_image_url(url):
         try:
-            img = requests.get(url, allow_redirects=True).content
+            img = requests.get(url).content
             with open("img.jpg", 'wb') as f:
                 f.write(img)
             with open("img.jpg", 'rb') as f:
@@ -169,7 +192,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Failed to download image.")
         return
 
-    # --- Handle video ---
     status_msg = await update.message.reply_text(f"📥 Hi {name}, downloading...")
 
     filename = "video.mp4"
@@ -196,7 +218,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'quiet': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        'allow_unplayable_formats': True,
         'http_headers': {'User-Agent': 'Mozilla/5.0'},
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',
@@ -233,7 +254,8 @@ async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TY
     audio_path = "audio.mp3"
 
     if not os.path.exists(video_path):
-        return await query.edit_message_caption("❌ Video file not found.")
+        await query.edit_message_caption("❌ Video file not found.")
+        return
 
     if convert_to_audio(video_path, audio_path):
         with open(audio_path, 'rb') as f:
@@ -244,7 +266,7 @@ async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     os.remove(video_path)
 
-# ========== WEBHOOK SETUP ==========
+# ========== WEBHOOK ==========
 
 web_app = web.Application()
 
@@ -272,13 +294,14 @@ async def on_cleanup(app):
 web_app.on_startup.append(on_startup)
 web_app.on_cleanup.append(on_cleanup)
 
-# ========== COMMANDS ==========
+# ========== COMMANDS & CALLBACKS ==========
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("profile", profile))
 application.add_handler(CommandHandler("admin", admin))
 application.add_handler(CommandHandler("upgrade", upgrade))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
+application.add_handler(CallbackQueryHandler(handle_inline_buttons))
 application.add_handler(CallbackQueryHandler(handle_audio_callback))
 
 # ========== RUN ==========
