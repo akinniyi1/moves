@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 
 # Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL")
+APP_URL = os.getenv("RENDER_EXTERNAL_URL")  # Required for webhook
 PORT = int(os.getenv("PORT", 10000))
 ADMIN_ID = 1378825382
 USER_DB = "users.json"
@@ -38,9 +38,13 @@ application = Application.builder().token(BOT_TOKEN).build()
 def is_valid_url(text):
     return re.match(r'https?://', text)
 
+def is_image_url(url):
+    image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
+    return url.lower().endswith(image_extensions)
+
 def convert_to_audio(video_path, audio_path):
     try:
-        ffmpeg.input(video_path).output(audio_path, format='mp3', audio_bitrate='320k').run(overwrite_output=True)
+        ffmpeg.input(video_path).output(audio_path, format='mp3').run(overwrite_output=True)
         return True
     except Exception as e:
         logging.error(f"Audio conversion failed: {e}")
@@ -59,12 +63,13 @@ def save_users(users):
 
 def get_user(user_id):
     users = load_users()
-    return users.get(str(user_id), {
+    user = users.get(str(user_id), {
         "plan": "free",
         "downloads": {},
         "name": "",
         "expires": None
     })
+    return user
 
 def update_user(user_id, data):
     users = load_users()
@@ -83,13 +88,15 @@ def can_download(user_id):
     user = get_user(user_id)
     today = datetime.utcnow().strftime("%Y-%m-%d")
     downloads_today = user["downloads"].get(today, 0)
+
     if user["plan"] == "free":
         return downloads_today < 3
-    expiry = user.get("expires")
-    if expiry and datetime.strptime(expiry, "%Y-%m-%d") < datetime.utcnow():
-        update_user(user_id, {"plan": "free", "expires": None})
-        return downloads_today < 3
-    return True
+    else:
+        expiry = user.get("expires")
+        if expiry and datetime.strptime(expiry, "%Y-%m-%d") < datetime.utcnow():
+            update_user(user_id, {"plan": "free", "expires": None})
+            return downloads_today < 3
+        return True
 
 def log_download(user_id):
     user = get_user(user_id)
@@ -102,28 +109,34 @@ def log_download(user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     update_user(user.id, {"name": user.first_name or ""})
+
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("\U0001F464 View Profile", callback_data="profile")],
-        [InlineKeyboardButton("\U0001F465 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
+        [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
+        [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ])
+
     await update.message.reply_text(
-        f"\U0001F44B Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
-        "\U0001F3B5 After download, you can convert it to audio.\n"
-        "\U0001F9FE You can also check your plan via 'View Profile'.",
+        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
+        "🎵 After download, you can convert it to audio.\n"
+        "🧾 You can also check your plan via 'View Profile'.",
         reply_markup=keyboard
     )
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     user = update.effective_user
+
     if not is_valid_url(url):
         await update.message.reply_text("❌ That doesn't look like a valid link.")
         return
+
     if not can_download(user.id):
         await update.message.reply_text("⛔ You've reached your daily limit for downloads.")
         return
+
     status_msg = await update.message.reply_text("📥 Downloading video...")
-    video_filename = f"video_{user.id}.mp4"
+
+    video_filename = "video.mp4"
     progress_state = {'last_percent': 0}
 
     def progress_hook(d):
@@ -157,43 +170,41 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
+
         log_download(user.id)
         await status_msg.edit_text("✅ Download complete.")
+
         with open(video_filename, 'rb') as f:
-            mime_type, _ = mimetypes.guess_type(video_filename)
             keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("\U0001F3B5 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
+                [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
             ])
-            await update.message.reply_document(
-                document=f,
-                filename=video_filename,
-                caption="📁 Here's your video! Large videos are sent as files so you can save them.",
-                reply_markup=keyboard,
-                mime_type=mime_type or "video/mp4"
-            )
+            await update.message.reply_video(f, caption="🎉 Here's your video!", reply_markup=keyboard)
+
     except Exception as e:
         logging.error(f"Download failed: {e}")
         await status_msg.edit_text("❌ Failed to download this video.")
-    finally:
-        if os.path.exists(video_filename):
-            os.remove(video_filename)
 
 async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not query.data.startswith("convert_audio:"):
         return
+
     video_path = query.data.split(":", 1)[1]
-    audio_path = f"audio_{query.from_user.id}.mp3"
+    audio_path = "audio.mp3"
+
     if not os.path.exists(video_path):
         await query.edit_message_caption("❌ Video file not found.")
         return
+
     success = convert_to_audio(video_path, audio_path)
     if not success:
         await query.edit_message_caption("❌ Audio conversion failed.")
         return
+
     with open(audio_path, 'rb') as f:
         await query.message.reply_audio(f, caption="🎧 Here is the audio version!")
+
     os.remove(video_path)
     os.remove(audio_path)
 
@@ -202,17 +213,21 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
     user_id = query.from_user.id
     data = query.data
     await query.answer()
+
     if data == "profile":
         user = get_user(user_id)
         plan = user["plan"]
         expires = user.get("expires")
         expiry_text = f"\n⏳ Expires: {expires}" if expires else ""
         await query.message.reply_text(
-            f"👤 Profile for {user.get('name', '')}\n💼 Plan: {plan}{expiry_text}"
+            f"👤 Profile for {user.get('name', '')}\n"
+            f"💼 Plan: {plan}{expiry_text}"
         )
+
     elif data == "total_users" and user_id == ADMIN_ID:
         users = load_users()
         await query.message.reply_text(f"👥 Total users: {len(users)}")
+
     elif data.startswith("upgrade:"):
         _, username, days = data.split(":")
         days = int(days)
@@ -231,9 +246,11 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Not authorized.")
         return
+
     if len(context.args) != 1:
         await update.message.reply_text("Usage: /upgrade <username>")
         return
+
     username = context.args[0]
     keyboard = InlineKeyboardMarkup([
         [
