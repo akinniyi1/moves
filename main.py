@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 
 from aiohttp import web
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -136,7 +136,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("📥 Downloading video...")
 
-    video_filename = "video.mp4"
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    video_filename = f"video_{user.id}_{timestamp}.mp4"
     progress_state = {'last_percent': 0}
 
     def progress_hook(d):
@@ -154,7 +155,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ydl_opts = {
         'progress_hooks': [progress_hook],
         'outtmpl': video_filename,
-        'format': 'bestvideo+bestaudio/best',
+        'format': 'bv*+ba/best',
         'merge_output_format': 'mp4',
         'noplaylist': True,
         'quiet': True,
@@ -164,7 +165,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',
             'preferedformat': 'mp4'
-        }]
+        }],
+        'retries': 10,
+        'fragment_retries': 10,
+        'continuedl': True,
+        'concurrent_fragment_downloads': 5
     }
 
     try:
@@ -174,24 +179,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_download(user.id)
         await status_msg.edit_text("✅ Download complete.")
 
-        file_size = os.path.getsize(video_filename)
-        max_size = 49 * 1024 * 1024  # 49MB Telegram video limit for bot
-
         with open(video_filename, 'rb') as f:
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
             ])
-            if file_size > max_size:
-                await update.message.reply_document(
-                    document=InputFile(f, filename=video_filename),
-                    caption="📁 This video is large and has been sent as a file instead of a video."
-                )
-            else:
-                await update.message.reply_video(
-                    video=f,
-                    caption="🎉 Here's your video!",
-                    reply_markup=keyboard
-                )
+            await update.message.reply_video(f, caption="🎉 Here's your video!", reply_markup=keyboard)
 
     except Exception as e:
         logging.error(f"Download failed: {e}")
