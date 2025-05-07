@@ -136,8 +136,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("📥 Downloading video...")
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    video_filename = f"video_{user.id}_{timestamp}.mp4"
+    video_filename = "video.mp4"
     progress_state = {'last_percent': 0}
 
     def progress_hook(d):
@@ -155,24 +154,26 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ydl_opts = {
         'progress_hooks': [progress_hook],
         'outtmpl': video_filename,
-        'format': 'bv*+ba/best',
+        'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'noplaylist': True,
-        'quiet': True,
         'geo_bypass': True,
         'nocheckcertificate': True,
+        'continuedl': True,
+        'retries': 20,
+        'fragment_retries': 20,
+        'concurrent_fragment_downloads': 5,
         'http_headers': {'User-Agent': 'Mozilla/5.0'},
+        'external_downloader_args': ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'],
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',
             'preferedformat': 'mp4'
         }],
-        'retries': 10,
-        'fragment_retries': 10,
-        'continuedl': True,
-        'concurrent_fragment_downloads': 5
+        'logger': logging.getLogger('yt_dlp'),
     }
 
     try:
+        logging.info(f"Trying to download: {url}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
