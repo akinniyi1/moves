@@ -38,6 +38,10 @@ application = Application.builder().token(BOT_TOKEN).build()
 def is_valid_url(text):
     return re.match(r'https?://', text)
 
+def is_image_url(url):
+    image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
+    return url.lower().endswith(image_extensions)
+
 def convert_to_audio(video_path, audio_path):
     try:
         ffmpeg.input(video_path).output(audio_path, format='mp3').run(overwrite_output=True)
@@ -104,9 +108,9 @@ def log_download(user_id):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    update_user(user.id, {"name": user.first_name or ""})
+    update_user(user.id, {"name": (user.first_name or "").lower()})
 
-    keyboard = InlineKeyboardMarkup([
+    keyboard = InlineKeyboardMarkup([ 
         [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ])
@@ -132,8 +136,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("📥 Downloading video...")
 
-    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    video_filename = f"{user.id}_{timestamp}.mp4"
+    video_filename = "video.mp4"
     progress_state = {'last_percent': 0}
 
     def progress_hook(d):
@@ -172,12 +175,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("✅ Download complete.")
 
         with open(video_filename, 'rb') as f:
-            keyboard = InlineKeyboardMarkup([
+            keyboard = InlineKeyboardMarkup([ 
                 [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
             ])
             await update.message.reply_video(f, caption="🎉 Here's your video!", reply_markup=keyboard)
-
-        os.remove(video_filename)
 
     except Exception as e:
         logging.error(f"Download failed: {e}")
@@ -190,7 +191,7 @@ async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     video_path = query.data.split(":", 1)[1]
-    audio_path = video_path.replace(".mp4", ".mp3")
+    audio_path = "audio.mp3"
 
     if not os.path.exists(video_path):
         await query.edit_message_caption("❌ Video file not found.")
@@ -217,7 +218,11 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         user = get_user(user_id)
         plan = user["plan"]
         expires = user.get("expires")
-        expiry_text = f"\n⏳ Expires: {expires}" if expires else ""
+        if expires and datetime.strptime(expires, "%Y-%m-%d") < datetime.utcnow():
+            plan = "free (expired)"
+            expiry_text = f"\n⛔ Upgrade expired on {expires}"
+        else:
+            expiry_text = f"\n⏳ Expires: {expires}" if expires else ""
         await query.message.reply_text(
             f"👤 Profile for {user.get('name', '')}\n"
             f"💼 Plan: {plan}{expiry_text}"
@@ -232,7 +237,7 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         days = int(days)
         users = load_users()
         for uid, u in users.items():
-            if u["name"].lower() == username.lower():
+            if u["name"] == username.lower():
                 expiry = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
                 u["plan"] = "paid"
                 u["expires"] = expiry
@@ -251,7 +256,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     username = context.args[0]
-    keyboard = InlineKeyboardMarkup([
+    keyboard = InlineKeyboardMarkup([ 
         [
             InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
             InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
