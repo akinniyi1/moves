@@ -28,10 +28,9 @@ PORT = int(os.getenv("PORT", 10000))
 
 # --- User Data File ---
 USER_FILE = "users.json"
-ADMIN_ID = 1378825382  # Your Telegram ID
+ADMIN_ID = 1378825382  # Replace with your actual Telegram ID
 
 application = Application.builder().token(BOT_TOKEN).build()
-
 
 # ========== HELPERS ==========
 
@@ -43,7 +42,7 @@ def is_image_url(url):
     if url.lower().endswith(image_ext):
         return True
     try:
-        head = requests.head(url, timeout=5)
+        head = requests.head(url, timeout=5, allow_redirects=True)
         return head.headers.get("Content-Type", "").startswith("image/")
     except:
         return False
@@ -107,7 +106,6 @@ def increment_download(user_data):
     else:
         user_data["downloads_today"] += 1
 
-
 # ========== HANDLERS ==========
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -119,9 +117,10 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = get_user_data(user.id, user.first_name)
     plan = "Premium ✅" if is_premium(data) else "Free 🆓"
     downloads = data.get("downloads_today", 0)
-    await update.message.reply_text(
-        f"👤 Name: {data['name']}\n📋 Plan: {plan}\n📥 Downloads Today: {downloads}/3" if plan == "Free 🆓" else f"👤 Name: {data['name']}\n📋 Plan: {plan}"
-    )
+    text = f"👤 Name: {data['name']}\n📋 Plan: {plan}"
+    if not is_premium(data):
+        text += f"\n📥 Downloads Today: {downloads}/3"
+    await update.message.reply_text(text)
 
 async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -148,21 +147,18 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     user = update.effective_user
     name = user.first_name or "friend"
-
     user_data = get_user_data(user.id, name)
 
     if not can_download(user_data):
-        await update.message.reply_text("⚠️ You’ve reached your daily limit of 3 downloads. Come back tomorrow.")
-        return
+        return await update.message.reply_text("⚠️ You’ve reached your daily limit of 3 downloads. Come back tomorrow.")
 
     if not is_valid_url(url):
-        await update.message.reply_text("❌ That doesn't look like a valid link.")
-        return
+        return await update.message.reply_text("❌ That doesn't look like a valid link.")
 
     # --- Handle image ---
     if is_image_url(url):
         try:
-            img = requests.get(url).content
+            img = requests.get(url, allow_redirects=True).content
             with open("img.jpg", 'wb') as f:
                 f.write(img)
             with open("img.jpg", 'rb') as f:
@@ -200,6 +196,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'quiet': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
+        'allow_unplayable_formats': True,
         'http_headers': {'User-Agent': 'Mozilla/5.0'},
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',
@@ -236,8 +233,7 @@ async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TY
     audio_path = "audio.mp3"
 
     if not os.path.exists(video_path):
-        await query.edit_message_caption("❌ Video file not found.")
-        return
+        return await query.edit_message_caption("❌ Video file not found.")
 
     if convert_to_audio(video_path, audio_path):
         with open(audio_path, 'rb') as f:
@@ -248,8 +244,7 @@ async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TY
 
     os.remove(video_path)
 
-
-# ========== WEBHOOK ==========
+# ========== WEBHOOK SETUP ==========
 
 web_app = web.Application()
 
@@ -276,7 +271,6 @@ async def on_cleanup(app):
 
 web_app.on_startup.append(on_startup)
 web_app.on_cleanup.append(on_cleanup)
-
 
 # ========== COMMANDS ==========
 
