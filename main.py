@@ -4,26 +4,43 @@ import ssl
 import json
 import logging
 import yt_dlp
+import mimetypes
 import requests
 import ffmpeg
 from datetime import datetime, timedelta
-from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
+from aiohttp import web
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
+)
+
+# Bypass SSL verification (fixes yt-dlp cert errors)
 ssl._create_default_https_context = ssl._create_unverified_context
+
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 
+# Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL")
+APP_URL = os.getenv("RENDER_EXTERNAL_URL")  # Required for webhook
 PORT = int(os.getenv("PORT", 10000))
 ADMIN_ID = 1378825382
 USER_DB = "users.json"
 
 application = Application.builder().token(BOT_TOKEN).build()
 
+# ----------- Helpers -----------
+
 def is_valid_url(text):
     return re.match(r'https?://', text)
+
+def is_image_url(url):
+    image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
+    return url.lower().endswith(image_extensions)
 
 def convert_to_audio(video_path, audio_path):
     try:
@@ -71,6 +88,7 @@ def can_download(user_id):
     user = get_user(user_id)
     today = datetime.utcnow().strftime("%Y-%m-%d")
     downloads_today = user["downloads"].get(today, 0)
+
     if user["plan"] == "free":
         return downloads_today < 3
     else:
@@ -86,13 +104,17 @@ def log_download(user_id):
     user["downloads"][today] = user["downloads"].get(today, 0) + 1
     update_user(user_id, {"downloads": user["downloads"]})
 
+# ----------- Handlers -----------
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     update_user(user.id, {"name": user.first_name or ""})
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ])
+
     await update.message.reply_text(
         f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
         "🎵 After download, you can convert it to audio.\n"
@@ -107,11 +129,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_valid_url(url):
         await update.message.reply_text("❌ That doesn't look like a valid link.")
         return
+
     if not can_download(user.id):
         await update.message.reply_text("⛔ You've reached your daily limit for downloads.")
         return
 
     status_msg = await update.message.reply_text("📥 Downloading video...")
+
     video_filename = "video.mp4"
     progress_state = {'last_percent': 0}
 
@@ -149,27 +173,25 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         log_download(user.id)
         await status_msg.edit_text("✅ Download complete.")
-        video_size = os.path.getsize(video_filename)
-        size_mb = video_size / (1024 * 1024)
+
+        file_size = os.path.getsize(video_filename)
+        max_size = 49 * 1024 * 1024  # 49MB Telegram video limit for bot
 
         with open(video_filename, 'rb') as f:
-            if size_mb >= 49:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
+            ])
+            if file_size > max_size:
                 await update.message.reply_document(
-                    f,
-                    caption="📦 This video is large and was sent as a file.\nEnjoy!",
-                    filename=video_filename
+                    document=InputFile(f, filename=video_filename),
+                    caption="📁 This video is large and has been sent as a file instead of a video."
                 )
             else:
-                keyboard = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
-                ])
                 await update.message.reply_video(
-                    f,
+                    video=f,
                     caption="🎉 Here's your video!",
                     reply_markup=keyboard
                 )
-
-        os.remove(video_filename)
 
     except Exception as e:
         logging.error(f"Download failed: {e}")
@@ -237,6 +259,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Not authorized.")
         return
+
     if len(context.args) != 1:
         await update.message.reply_text("Usage: /upgrade <username>")
         return
@@ -250,6 +273,8 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
+
+# ----------- Webhook Setup -----------
 
 web_app = web.Application()
 
@@ -278,11 +303,15 @@ async def on_cleanup(app):
 web_app.on_startup.append(on_startup)
 web_app.on_cleanup.append(on_cleanup)
 
+# ----------- Register Handlers -----------
+
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("upgrade", upgrade_user))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
 application.add_handler(CallbackQueryHandler(handle_audio_callback, pattern="^convert_audio:"))
 application.add_handler(CallbackQueryHandler(handle_inline_buttons))
+
+# ----------- Run -----------
 
 if __name__ == "__main__":
     web.run_app(web_app, port=PORT)
