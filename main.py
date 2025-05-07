@@ -38,10 +38,6 @@ application = Application.builder().token(BOT_TOKEN).build()
 def is_valid_url(text):
     return re.match(r'https?://', text)
 
-def is_image_url(url):
-    image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
-    return url.lower().endswith(image_extensions)
-
 def convert_to_audio(video_path, audio_path):
     try:
         ffmpeg.input(video_path).output(audio_path, format='mp3').run(overwrite_output=True)
@@ -136,7 +132,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text("📥 Downloading video...")
 
-    video_filename = "video.mp4"
+    timestamp = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    video_filename = f"{user.id}_{timestamp}.mp4"
     progress_state = {'last_percent': 0}
 
     def progress_hook(d):
@@ -157,23 +154,17 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'noplaylist': True,
+        'quiet': True,
         'geo_bypass': True,
         'nocheckcertificate': True,
-        'continuedl': True,
-        'retries': 20,
-        'fragment_retries': 20,
-        'concurrent_fragment_downloads': 5,
         'http_headers': {'User-Agent': 'Mozilla/5.0'},
-        'external_downloader_args': ['-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5'],
         'postprocessors': [{
             'key': 'FFmpegVideoConvertor',
             'preferedformat': 'mp4'
-        }],
-        'logger': logging.getLogger('yt_dlp'),
+        }]
     }
 
     try:
-        logging.info(f"Trying to download: {url}")
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
 
@@ -186,6 +177,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
             await update.message.reply_video(f, caption="🎉 Here's your video!", reply_markup=keyboard)
 
+        os.remove(video_filename)
+
     except Exception as e:
         logging.error(f"Download failed: {e}")
         await status_msg.edit_text("❌ Failed to download this video.")
@@ -197,7 +190,7 @@ async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     video_path = query.data.split(":", 1)[1]
-    audio_path = "audio.mp3"
+    audio_path = video_path.replace(".mp4", ".mp3")
 
     if not os.path.exists(video_path):
         await query.edit_message_caption("❌ Video file not found.")
