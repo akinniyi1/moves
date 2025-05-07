@@ -108,9 +108,9 @@ def log_download(user_id):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    update_user(user.id, {"name": (user.first_name or "").lower()})
+    update_user(user.id, {"name": user.first_name or ""})
 
-    keyboard = InlineKeyboardMarkup([ 
+    keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ])
@@ -175,7 +175,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("✅ Download complete.")
 
         with open(video_filename, 'rb') as f:
-            keyboard = InlineKeyboardMarkup([ 
+            keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
             ])
             await update.message.reply_video(f, caption="🎉 Here's your video!", reply_markup=keyboard)
@@ -218,11 +218,7 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         user = get_user(user_id)
         plan = user["plan"]
         expires = user.get("expires")
-        if expires and datetime.strptime(expires, "%Y-%m-%d") < datetime.utcnow():
-            plan = "free (expired)"
-            expiry_text = f"\n⛔ Upgrade expired on {expires}"
-        else:
-            expiry_text = f"\n⏳ Expires: {expires}" if expires else ""
+        expiry_text = f"\n⏳ Expires: {expires}" if expires else ""
         await query.message.reply_text(
             f"👤 Profile for {user.get('name', '')}\n"
             f"💼 Plan: {plan}{expiry_text}"
@@ -237,7 +233,7 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         days = int(days)
         users = load_users()
         for uid, u in users.items():
-            if u["name"] == username.lower():
+            if u["name"].lower() == username.lower():
                 expiry = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
                 u["plan"] = "paid"
                 u["expires"] = expiry
@@ -256,7 +252,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     username = context.args[0]
-    keyboard = InlineKeyboardMarkup([ 
+    keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
             InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
