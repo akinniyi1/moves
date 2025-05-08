@@ -7,8 +7,6 @@ import yt_dlp
 import mimetypes
 import requests
 import ffmpeg
-import firebase_admin
-from firebase_admin import credentials, firestore
 from datetime import datetime, timedelta
 
 from aiohttp import web
@@ -26,16 +24,12 @@ ssl._create_default_https_context = ssl._create_unverified_context
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 
-# Firebase Setup
-cred = credentials.Certificate('path/to/your/firebase-service-account-key.json')
-firebase_admin.initialize_app(cred)
-db = firestore.client()
-
 # Environment variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 APP_URL = os.getenv("RENDER_EXTERNAL_URL")  # Required for webhook
 PORT = int(os.getenv("PORT", 10000))
 ADMIN_ID = 1378825382
+USER_DB = "users.json"
 
 application = Application.builder().token(BOT_TOKEN).build()
 
@@ -56,23 +50,39 @@ def convert_to_audio(video_path, audio_path):
         logging.error(f"Audio conversion failed: {e}")
         return False
 
+def load_users():
+    if not os.path.exists(USER_DB):
+        with open(USER_DB, 'w') as f:
+            json.dump({}, f)
+    with open(USER_DB, 'r') as f:
+        return json.load(f)
+
+def save_users(users):
+    with open(USER_DB, 'w') as f:
+        json.dump(users, f, indent=2)
+
 def get_user(user_id):
-    user_ref = db.collection('users').document(str(user_id))
-    doc = user_ref.get()
-    if doc.exists:
-        return doc.to_dict()
-    else:
-        # If the user doesn't exist, create a default user
-        return {
+    users = load_users()
+    user = users.get(str(user_id), {
+        "plan": "free",
+        "downloads": {},
+        "name": "",
+        "expires": None
+    })
+    return user
+
+def update_user(user_id, data):
+    users = load_users()
+    uid = str(user_id)
+    if uid not in users:
+        users[uid] = {
             "plan": "free",
             "downloads": {},
             "name": "",
             "expires": None
         }
-
-def update_user(user_id, data):
-    user_ref = db.collection('users').document(str(user_id))
-    user_ref.set(data, merge=True)
+    users[uid].update(data)
+    save_users(users)
 
 def can_download(user_id):
     user = get_user(user_id)
@@ -91,8 +101,7 @@ def can_download(user_id):
 def log_download(user_id):
     user = get_user(user_id)
     today = datetime.utcnow().strftime("%Y-%m-%d")
-    downloads_today = user["downloads"].get(today, 0) + 1
-    user["downloads"][today] = downloads_today
+    user["downloads"][today] = user["downloads"].get(today, 0) + 1
     update_user(user_id, {"downloads": user["downloads"]})
 
 # ----------- Handlers -----------
@@ -101,7 +110,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     update_user(user.id, {"name": user.first_name or ""})
 
-    keyboard = InlineKeyboardMarkup([ 
+    keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ])
@@ -166,7 +175,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.edit_text("✅ Download complete.")
 
         with open(video_filename, 'rb') as f:
-            keyboard = InlineKeyboardMarkup([ 
+            keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
             ])
             await update.message.reply_video(f, caption="🎉 Here's your video!", reply_markup=keyboard)
@@ -216,21 +225,19 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     elif data == "total_users" and user_id == ADMIN_ID:
-        users = db.collection('users').stream()
-        total_users = sum(1 for _ in users)
-        await query.message.reply_text(f"👥 Total users: {total_users}")
+        users = load_users()
+        await query.message.reply_text(f"👥 Total users: {len(users)}")
 
     elif data.startswith("upgrade:"):
         _, username, days = data.split(":")
         days = int(days)
-        users = db.collection('users').stream()
-        for doc in users:
-            u = doc.to_dict()
+        users = load_users()
+        for uid, u in users.items():
             if u["name"].lower() == username.lower():
                 expiry = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
                 u["plan"] = "paid"
                 u["expires"] = expiry
-                db.collection('users').document(doc.id).set(u)
+                save_users(users)
                 await query.message.reply_text(f"✅ {username} upgraded for {days} days.")
                 return
         await query.message.reply_text("❌ User not found.")
@@ -245,7 +252,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     username = context.args[0]
-    keyboard = InlineKeyboardMarkup([ 
+    keyboard = InlineKeyboardMarkup([
         [
             InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
             InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
