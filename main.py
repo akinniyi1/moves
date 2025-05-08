@@ -1,208 +1,297 @@
 import os
-import yt_dlp
-import logging
+import re
+import ssl
 import json
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, ContextTypes
-from datetime import datetime, timedelta
+import logging
+import yt_dlp
+import mimetypes
+import requests
+import ffmpeg
 import firebase_admin
 from firebase_admin import credentials, firestore
+from datetime import datetime, timedelta
 
-# --- Firebase Setup ---
-cred = credentials.Certificate("firebase.json")
+from aiohttp import web
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
+)
+
+# Bypass SSL verification (fixes yt-dlp cert errors)
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+
+# Firebase Setup
+cred = credentials.Certificate('path/to/your/firebase-service-account-key.json')
 firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# --- Bot Setup ---
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 1378825382  # Replace with your Telegram ID
+# Environment variables
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+APP_URL = os.getenv("RENDER_EXTERNAL_URL")  # Required for webhook
+PORT = int(os.getenv("PORT", 10000))
+ADMIN_ID = 1378825382
 
-DAILY_LIMIT = 3
+application = Application.builder().token(BOT_TOKEN).build()
 
-def get_user_data(user_id, username=""):
-    doc_ref = db.collection("users").document(str(user_id))
-    doc = doc_ref.get()
+# ----------- Helpers -----------
+
+def is_valid_url(text):
+    return re.match(r'https?://', text)
+
+def is_image_url(url):
+    image_extensions = ('.jpg', '.jpeg', '.png', '.gif', '.webp')
+    return url.lower().endswith(image_extensions)
+
+def convert_to_audio(video_path, audio_path):
+    try:
+        ffmpeg.input(video_path).output(audio_path, format='mp3').run(overwrite_output=True)
+        return True
+    except Exception as e:
+        logging.error(f"Audio conversion failed: {e}")
+        return False
+
+def get_user(user_id):
+    user_ref = db.collection('users').document(str(user_id))
+    doc = user_ref.get()
     if doc.exists:
         return doc.to_dict()
     else:
-        data = {
-            "username": username,
-            "downloads": 0,
+        # If the user doesn't exist, create a default user
+        return {
             "plan": "free",
+            "downloads": {},
+            "name": "",
             "expires": None
         }
-        doc_ref.set(data)
-        return data
 
-def save_user_data(user_id, data):
-    db.collection("users").document(str(user_id)).set(data)
+def update_user(user_id, data):
+    user_ref = db.collection('users').document(str(user_id))
+    user_ref.set(data, merge=True)
 
-def update_download_count(user_id, username):
-    data = get_user_data(user_id, username)
-    data["downloads"] += 1
-    save_user_data(user_id, data)
+def can_download(user_id):
+    user = get_user(user_id)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    downloads_today = user["downloads"].get(today, 0)
 
-def reset_all_downloads():
-    users_ref = db.collection("users")
-    for doc in users_ref.stream():
-        user = doc.to_dict()
-        user["downloads"] = 0
-        db.collection("users").document(doc.id).set(user)
+    if user["plan"] == "free":
+        return downloads_today < 3
+    else:
+        expiry = user.get("expires")
+        if expiry and datetime.strptime(expiry, "%Y-%m-%d") < datetime.utcnow():
+            update_user(user_id, {"plan": "free", "expires": None})
+            return downloads_today < 3
+        return True
 
-def get_total_users():
-    return len(list(db.collection("users").stream()))
+def log_download(user_id):
+    user = get_user(user_id)
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    downloads_today = user["downloads"].get(today, 0) + 1
+    user["downloads"][today] = downloads_today
+    update_user(user_id, {"downloads": user["downloads"]})
+
+# ----------- Handlers -----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    get_user_data(user.id, user.username)
+    update_user(user.id, {"name": user.first_name or ""})
 
-    keyboard = [
-        [InlineKeyboardButton("👤 My Profile", callback_data='profile')],
-        [InlineKeyboardButton("📊 Admin Panel", callback_data='admin')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text(f"👋 Hello {user.first_name}, send me any video link to download.", reply_markup=reply_markup)
+    keyboard = InlineKeyboardMarkup([ 
+        [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
+        [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
+    ])
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
+        "🎵 After download, you can convert it to audio.\n"
+        "🧾 You can also check your plan via 'View Profile'.",
+        reply_markup=keyboard
+    )
+
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
     user = update.effective_user
-    user_data = get_user_data(user.id, user.username)
 
-    now = datetime.utcnow()
-
-    # Check subscription
-    if user_data["plan"] != "free":
-        if user_data["expires"]:
-            expiry = datetime.strptime(user_data["expires"], "%Y-%m-%d")
-            if expiry < now:
-                user_data["plan"] = "free"
-                user_data["downloads"] = 0
-                user_data["expires"] = None
-                await update.message.reply_text("⏰ Your plan has expired. You are now on the free plan.")
-
-    if user_data["plan"] == "free" and user_data["downloads"] >= DAILY_LIMIT:
-        await update.message.reply_text("🚫 Daily limit reached. Upgrade your plan for more downloads.")
+    if not is_valid_url(url):
+        await update.message.reply_text("❌ That doesn't look like a valid link.")
         return
 
-    url = update.message.text
+    if not can_download(user.id):
+        await update.message.reply_text("⛔ You've reached your daily limit for downloads.")
+        return
 
-    keyboard = [
-        [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f'audio|{url}')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("⏬ Processing your video...", reply_markup=reply_markup)
+    status_msg = await update.message.reply_text("📥 Downloading video...")
+
+    video_filename = "video.mp4"
+    progress_state = {'last_percent': 0}
+
+    def progress_hook(d):
+        if d['status'] == 'downloading':
+            total = d.get('_total_bytes_estimate') or d.get('total_bytes') or 0
+            downloaded = d.get('downloaded_bytes') or 0
+            if total > 0:
+                percent = int(downloaded * 100 / total)
+                if percent - progress_state['last_percent'] >= 10:
+                    progress_state['last_percent'] = percent
+                    context.application.create_task(
+                        status_msg.edit_text(f"📦 Downloading... {percent}%")
+                    )
+
+    ydl_opts = {
+        'progress_hooks': [progress_hook],
+        'outtmpl': video_filename,
+        'format': 'bestvideo+bestaudio/best',
+        'merge_output_format': 'mp4',
+        'noplaylist': True,
+        'quiet': True,
+        'geo_bypass': True,
+        'nocheckcertificate': True,
+        'http_headers': {'User-Agent': 'Mozilla/5.0'},
+        'postprocessors': [{
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4'
+        }]
+    }
 
     try:
-        ydl_opts = {
-            'outtmpl': f'{user.id}.%(ext)s',
-            'format': 'bestvideo+bestaudio/best',
-            'noplaylist': True,
-            'quiet': True
-        }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            file_path = ydl.prepare_filename(info)
-            await update.message.reply_video(video=open(file_path, 'rb'))
-            os.remove(file_path)
+            ydl.download([url])
 
-        update_download_count(user.id, user.username)
+        log_download(user.id)
+        await status_msg.edit_text("✅ Download complete.")
+
+        with open(video_filename, 'rb') as f:
+            keyboard = InlineKeyboardMarkup([ 
+                [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
+            ])
+            await update.message.reply_video(f, caption="🎉 Here's your video!", reply_markup=keyboard)
 
     except Exception as e:
-        logging.error(e)
-        await update.message.reply_text("❌ Failed to download video. Try another link.")
+        logging.error(f"Download failed: {e}")
+        await status_msg.edit_text("❌ Failed to download this video.")
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user = query.from_user
-    user_data = get_user_data(user.id, user.username)
+    if not query.data.startswith("convert_audio:"):
+        return
 
-    if query.data.startswith('audio|'):
-        url = query.data.split('|', 1)[1]
-        await query.edit_message_text("🎵 Converting to audio...")
+    video_path = query.data.split(":", 1)[1]
+    audio_path = "audio.mp3"
 
-        try:
-            ydl_opts = {
-                'outtmpl': f'{user.id}.%(ext)s',
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-                'quiet': True
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                file_path = ydl.prepare_filename(info).rsplit('.', 1)[0] + ".mp3"
-                await query.message.reply_audio(audio=open(file_path, 'rb'))
-                os.remove(file_path)
+    if not os.path.exists(video_path):
+        await query.edit_message_caption("❌ Video file not found.")
+        return
 
-        except Exception as e:
-            logging.error(e)
-            await query.message.reply_text("❌ Failed to convert video to audio.")
+    success = convert_to_audio(video_path, audio_path)
+    if not success:
+        await query.edit_message_caption("❌ Audio conversion failed.")
+        return
 
-    elif query.data == 'profile':
-        plan = user_data['plan']
-        downloads = user_data['downloads']
-        expires = user_data.get("expires", "N/A")
-        profile_msg = f"👤 *Username:* @{user.username or 'N/A'}\n💼 *Plan:* {plan}\n⬇️ *Downloads today:* {downloads}/{DAILY_LIMIT if plan == 'free' else '∞'}\n⏳ *Expires:* {expires}"
-        await query.message.reply_text(profile_msg, parse_mode='Markdown')
+    with open(audio_path, 'rb') as f:
+        await query.message.reply_audio(f, caption="🎧 Here is the audio version!")
 
-    elif query.data == 'admin' and user.id == ADMIN_ID:
-        total_users = get_total_users()
-        buttons = [
-            [InlineKeyboardButton("🔥 Upgrade 5d", callback_data="upgrade_5")],
-            [InlineKeyboardButton("🔥 Upgrade 10d", callback_data="upgrade_10")],
-            [InlineKeyboardButton("🔥 Upgrade 30d", callback_data="upgrade_30")],
-            [InlineKeyboardButton("🔄 Reset Downloads", callback_data="reset_dl")]
-        ]
-        await query.message.reply_text(f"👥 Total users: {total_users}", reply_markup=InlineKeyboardMarkup(buttons))
+    os.remove(video_path)
+    os.remove(audio_path)
 
-    elif query.data.startswith("upgrade_"):
-        days = int(query.data.replace("upgrade_", ""))
-        context.user_data["upgrade_days"] = days
-        await query.message.reply_text("✏️ Send the @username of the user to upgrade:")
+async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = query.data
+    await query.answer()
 
-    elif query.data == "reset_dl":
-        reset_all_downloads()
-        await query.message.reply_text("✅ All download counts reset.")
+    if data == "profile":
+        user = get_user(user_id)
+        plan = user["plan"]
+        expires = user.get("expires")
+        expiry_text = f"\n⏳ Expires: {expires}" if expires else ""
+        await query.message.reply_text(
+            f"👤 Profile for {user.get('name', '')}\n"
+            f"💼 Plan: {plan}{expiry_text}"
+        )
 
-async def handle_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    elif data == "total_users" and user_id == ADMIN_ID:
+        users = db.collection('users').stream()
+        total_users = sum(1 for _ in users)
+        await query.message.reply_text(f"👥 Total users: {total_users}")
+
+    elif data.startswith("upgrade:"):
+        _, username, days = data.split(":")
+        days = int(days)
+        users = db.collection('users').stream()
+        for doc in users:
+            u = doc.to_dict()
+            if u["name"].lower() == username.lower():
+                expiry = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
+                u["plan"] = "paid"
+                u["expires"] = expiry
+                db.collection('users').document(doc.id).set(u)
+                await query.message.reply_text(f"✅ {username} upgraded for {days} days.")
+                return
+        await query.message.reply_text("❌ User not found.")
+
+async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Not authorized.")
         return
-    if "upgrade_days" not in context.user_data:
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /upgrade <username>")
         return
 
-    username = update.message.text.replace("@", "")
-    days = context.user_data.pop("upgrade_days")
+    username = context.args[0]
+    keyboard = InlineKeyboardMarkup([ 
+        [
+            InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
+            InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
+            InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")
+        ]
+    ])
+    await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
-    users_ref = db.collection("users")
-    query = users_ref.where("username", "==", username).limit(1).stream()
-    found = False
+# ----------- Webhook Setup -----------
 
-    for doc in query:
-        found = True
-        user = doc.to_dict()
-        expiry = datetime.utcnow() + timedelta(days=days)
-        user["plan"] = "premium"
-        user["downloads"] = 0
-        user["expires"] = expiry.strftime("%Y-%m-%d")
-        db.collection("users").document(doc.id).set(user)
-        await update.message.reply_text(f"✅ Upgraded @{username} for {days} days.")
-        break
+web_app = web.Application()
 
-    if not found:
-        await update.message.reply_text("❌ User not found.")
+async def webhook_handler(request):
+    try:
+        data = await request.json()
+        update = Update.de_json(data, application.bot)
+        await application.update_queue.put(update)
+    except Exception as e:
+        logging.error(f"Webhook error: {e}")
+    return web.Response(text="ok")
 
-def main():
-    app = Application.builder().token(TOKEN).build()
+web_app.router.add_post("/webhook", webhook_handler)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & filters.User(ADMIN_ID), handle_upgrade))
+async def on_startup(app):
+    await application.initialize()
+    await application.start()
+    webhook_url = f"{APP_URL}/webhook"
+    await application.bot.set_webhook(webhook_url)
+    logging.info(f"✅ Webhook set: {webhook_url}")
 
-    app.run_polling()
+async def on_cleanup(app):
+    await application.stop()
+    await application.shutdown()
+
+web_app.on_startup.append(on_startup)
+web_app.on_cleanup.append(on_cleanup)
+
+# ----------- Register Handlers -----------
+
+application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("upgrade", upgrade_user))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
+application.add_handler(CallbackQueryHandler(handle_audio_callback, pattern="^convert_audio:"))
+application.add_handler(CallbackQueryHandler(handle_inline_buttons))
+
+# ----------- Run -----------
 
 if __name__ == "__main__":
-    main()
+    web.run_app(web_app, port=PORT)
