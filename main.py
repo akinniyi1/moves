@@ -8,6 +8,7 @@ import mimetypes
 import requests
 import ffmpeg
 import asyncpg
+import asyncio
 from datetime import datetime, timedelta
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -28,6 +29,7 @@ DB_URL = os.getenv("DATABASE_URL")
 application = Application.builder().token(BOT_TOKEN).build()
 db_pool = None
 user_states = {}
+user_files = {}
 
 # ---------- DB HELPERS ----------
 
@@ -97,10 +99,12 @@ def is_valid_url(text):
 def generate_filename(ext="mp4"):
     return f"video_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
 
-async def send_large_file(update, file_path):
-    with open(file_path, 'rb') as f:
-        await update.message.reply_document(f, filename=os.path.basename(file_path), caption="📁 Here's your large video file!")
-    os.remove(file_path)
+async def auto_delete(file_path, user_id):
+    await asyncio.sleep(60)
+    if os.path.exists(file_path):
+        os.remove(file_path)
+    if user_id in user_files and user_files[user_id] == file_path:
+        del user_files[user_id]
 
 # ---------- HANDLERS ----------
 
@@ -108,17 +112,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update_user(user.id, {"name": user.first_name or ""})
 
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👤 View Profile", callback_data="profile"),
-            InlineKeyboardButton("📁 Download Large File", callback_data="large_file_mode")
-        ],
-        [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
-    ])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("👤 View Profile", callback_data="profile"),
+        InlineKeyboardButton("🎵 Convert to Audio", callback_data="convert_audio")
+    ]] + ([[InlineKeyboardButton("👥 Total Users", callback_data="total_users")]] if user.id == ADMIN_ID else []))
 
     await update.message.reply_text(
-        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
-        "📌 If the download fails due to size, return to main menu and click 'Download Large File'.",
+        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.",
         reply_markup=keyboard
     )
 
@@ -128,11 +128,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not is_valid_url(url):
         await update.message.reply_text("❌ That doesn't look like a valid link.")
-        return
-
-    if user.id in user_states and user_states[user.id] == "awaiting_large_link":
-        await handle_large_video(update, context, url)
-        user_states.pop(user.id)
         return
 
     if not await can_download(user.id):
@@ -165,6 +160,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'geo_bypass': True,
         'nocheckcertificate': True,
         'http_headers': {'User-Agent': 'Mozilla/5.0'},
+        'max_filesize': 50 * 1024 * 1024  # 50 MB
     }
 
     try:
@@ -172,39 +168,14 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ydl.download([url])
         await log_download(user.id)
         await status_msg.edit_text("✅ Download complete.")
+
         with open(filename, 'rb') as f:
             await update.message.reply_video(f, caption="🎉 Here's your video!")
-        os.remove(filename)
+        user_files[user.id] = filename
+        context.application.create_task(auto_delete(filename, user.id))
     except Exception as e:
         logging.error(f"Download error: {e}")
-        await status_msg.edit_text(
-            "⚠️ Download failed. The file may be too large.\n"
-            "Go back to main menu and click '📁 Download Large File'."
-        )
-
-async def handle_large_video(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
-    filename = generate_filename()
-    status_msg = await update.message.reply_text("📁 Attempting large file download...")
-
-    ydl_opts = {
-        'outtmpl': filename,
-        'format': 'bestvideo+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'noplaylist': True,
-        'geo_bypass': True,
-        'nocheckcertificate': True,
-        'http_headers': {'User-Agent': 'Mozilla/5.0'},
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        await status_msg.edit_text("✅ Download complete. Sending file...")
-        await send_large_file(update, filename)
-    except Exception as e:
-        logging.error(f"Large download failed: {e}")
-        await status_msg.edit_text("❌ Large file download failed.")
+        await status_msg.edit_text("⚠️ Download failed. The file may be too large.")
 
 async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -224,9 +195,22 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             count = await conn.fetchval("SELECT COUNT(*) FROM users")
             await query.message.reply_text(f"👥 Total users: {count}")
 
-    elif data == "large_file_mode":
-        user_states[user_id] = "awaiting_large_link"
-        await query.message.reply_text("📥 Send the link to the large video now.")
+    elif data == "convert_audio":
+        if user_id not in user_files or not os.path.exists(user_files[user_id]):
+            await query.message.reply_text("❌ The file has been deleted. Please resend the video link and convert to audio within 1 minute to avoid loss.")
+            return
+
+        video_path = user_files[user_id]
+        audio_path = video_path.replace(".mp4", ".mp3")
+
+        try:
+            ffmpeg.input(video_path).output(audio_path).run(overwrite_output=True)
+            with open(audio_path, 'rb') as f:
+                await query.message.reply_audio(f, title="🎧 Your audio is ready!")
+            os.remove(audio_path)
+        except Exception as e:
+            logging.error(f"Audio conversion error: {e}")
+            await query.message.reply_text("⚠️ Failed to convert to audio.")
 
 async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -236,13 +220,11 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /upgrade <username>")
         return
     username = context.args[0]
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
-            InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
-            InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")
-        ]
-    ])
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
+        InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
+        InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")
+    ]])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
 # ---------- WEBHOOK SETUP ----------
