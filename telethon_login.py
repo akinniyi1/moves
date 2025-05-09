@@ -3,12 +3,13 @@ import asyncio
 from telethon.sync import TelegramClient
 from telethon.sessions import StringSession
 
-api_id = int(os.getenv("25469867"))
-api_hash = os.getenv("029a35f93bf8c618e67c995b9b94d26b"))
+api_id = int(os.getenv("TELETHON_API_ID"))
+api_hash = os.getenv("TELETHON_API_HASH")
 
 async def main():
     print("Starting login...")
     async with TelegramClient(StringSession(), api_id, api_hash) as client:
+        await client.start()
         print("Login successful.")
         print("Copy and save the following session string:")
         print(client.session.save())
