@@ -250,5 +250,5 @@ application.add_handler(CommandHandler("upgrade", upgrade_user))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
 application.add_handler(CallbackQueryHandler(handle_button))
 
-if __name__ == "__main__":
-    web.run_app(web_app, port=PORT)
+import telethon_login
+
