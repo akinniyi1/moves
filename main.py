@@ -8,7 +8,6 @@ import mimetypes
 import requests
 import ffmpeg
 import asyncpg
-from uuid import uuid4
 from datetime import datetime, timedelta
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -17,13 +16,9 @@ from telegram.ext import (
     CallbackQueryHandler, ContextTypes, filters
 )
 
-# SSL workaround for yt-dlp
 ssl._create_default_https_context = ssl._create_unverified_context
-
-# Logging
 logging.basicConfig(level=logging.INFO)
 
-# Env vars
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 APP_URL = os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", 10000))
@@ -32,8 +27,9 @@ DB_URL = os.getenv("DATABASE_URL")
 
 application = Application.builder().token(BOT_TOKEN).build()
 db_pool = None
+user_states = {}
 
-# ----------- DB Helpers -----------
+# ---------- DB HELPERS ----------
 
 async def get_user(user_id):
     async with db_pool.acquire() as conn:
@@ -63,18 +59,20 @@ async def update_user(user_id, data):
         user = await get_user(user_id)
         user.update(data)
         downloads_json = json.dumps(user["downloads"])
-        await conn.execute("""
+        await conn.execute(
+            """
             INSERT INTO users (id, name, plan, downloads, expires)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO UPDATE SET
               name = $2, plan = $3, downloads = $4, expires = $5
-        """, user["id"], user["name"], user["plan"], downloads_json, user["expires"])
+            """,
+            user["id"], user["name"], user["plan"], downloads_json, user["expires"]
+        )
 
 async def can_download(user_id):
     user = await get_user(user_id)
     today = datetime.utcnow().strftime("%Y-%m-%d")
     downloads_today = user["downloads"].get(today, 0)
-
     if user["plan"] == "free":
         return downloads_today < 3
     else:
@@ -91,52 +89,58 @@ async def log_download(user_id):
     downloads[today] = downloads.get(today, 0) + 1
     await update_user(user_id, {"downloads": downloads})
 
-# ----------- Bot Helpers -----------
+# ---------- BOT HELPERS ----------
 
 def is_valid_url(text):
     return re.match(r'https?://', text)
 
-def convert_to_audio(video_path, audio_path):
-    try:
-        ffmpeg.input(video_path).output(audio_path, format='mp3').run(overwrite_output=True)
-        return True
-    except Exception as e:
-        logging.error(f"Audio conversion failed: {e}")
-        return False
+def generate_filename(ext="mp4"):
+    return f"video_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
 
-# ----------- Handlers -----------
+async def send_large_file(update, file_path):
+    with open(file_path, 'rb') as f:
+        await update.message.reply_document(f, filename=os.path.basename(file_path), caption="📁 Here's your large video file!")
+    os.remove(file_path)
+
+# ---------- HANDLERS ----------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update_user(user.id, {"name": user.first_name or ""})
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
+        [
+            InlineKeyboardButton("👤 View Profile", callback_data="profile"),
+            InlineKeyboardButton("📁 Download Large File", callback_data="large_file_mode")
+        ],
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ])
 
     await update.message.reply_text(
         f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
-        "🎵 After download, you can convert it to audio.\n"
-        "🧾 You can also check your plan via 'View Profile'.",
+        "📌 If the download fails due to size, return to main menu and click 'Download Large File'.",
         reply_markup=keyboard
     )
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
     user = update.effective_user
+    url = update.message.text.strip()
 
     if not is_valid_url(url):
         await update.message.reply_text("❌ That doesn't look like a valid link.")
         return
 
-    if not await can_download(user.id):
-        await update.message.reply_text("⛔ You've reached your daily limit for downloads.")
+    if user.id in user_states and user_states[user.id] == "awaiting_large_link":
+        await handle_large_video(update, context, url)
+        user_states.pop(user.id)
         return
 
+    if not await can_download(user.id):
+        await update.message.reply_text("⛔ You've reached your daily limit.")
+        return
+
+    filename = generate_filename()
     status_msg = await update.message.reply_text("📥 Downloading video...")
-    unique_id = str(uuid4())[:8]
-    video_filename = f"video_{unique_id}.mp4"
     progress_state = {'last_percent': 0}
 
     def progress_hook(d):
@@ -148,12 +152,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if percent - progress_state['last_percent'] >= 10:
                     progress_state['last_percent'] = percent
                     context.application.create_task(
-                        status_msg.edit_text(f"📦 Downloading... {percent}%")
+                        status_msg.edit_text(f"⏬ Downloading... {percent}%")
                     )
 
     ydl_opts = {
         'progress_hooks': [progress_hook],
-        'outtmpl': video_filename,
+        'outtmpl': filename,
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'noplaylist': True,
@@ -161,10 +165,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'geo_bypass': True,
         'nocheckcertificate': True,
         'http_headers': {'User-Agent': 'Mozilla/5.0'},
-        'postprocessors': [{
-            'key': 'FFmpegVideoConvertor',
-            'preferedformat': 'mp4'
-        }]
     }
 
     try:
@@ -172,37 +172,39 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ydl.download([url])
         await log_download(user.id)
         await status_msg.edit_text("✅ Download complete.")
-
-        with open(video_filename, 'rb') as f:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"convert_audio:{video_filename}")]
-            ])
-            await update.message.reply_video(f, caption="🎉 Here's your video!", reply_markup=keyboard)
-
-        os.remove(video_filename)
-
+        with open(filename, 'rb') as f:
+            await update.message.reply_video(f, caption="🎉 Here's your video!")
+        os.remove(filename)
     except Exception as e:
-        logging.error(f"Download failed: {e}")
-        await status_msg.edit_text("❌ Failed to download this video.")
+        logging.error(f"Download error: {e}")
+        await status_msg.edit_text(
+            "⚠️ Download failed. The file may be too large.\n"
+            "Go back to main menu and click '📁 Download Large File'."
+        )
 
-async def handle_audio_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    video_path = query.data.split(":", 1)[1]
-    audio_path = f"audio_{str(uuid4())[:8]}.mp3"
+async def handle_large_video(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+    filename = generate_filename()
+    status_msg = await update.message.reply_text("📁 Attempting large file download...")
 
-    if not os.path.exists(video_path):
-        await query.edit_message_caption("❌ Video file not found.")
-        return
+    ydl_opts = {
+        'outtmpl': filename,
+        'format': 'bestvideo+bestaudio/best',
+        'merge_output_format': 'mp4',
+        'quiet': True,
+        'noplaylist': True,
+        'geo_bypass': True,
+        'nocheckcertificate': True,
+        'http_headers': {'User-Agent': 'Mozilla/5.0'},
+    }
 
-    if not convert_to_audio(video_path, audio_path):
-        await query.edit_message_caption("❌ Audio conversion failed.")
-        return
-
-    with open(audio_path, 'rb') as f:
-        await query.message.reply_audio(f, caption="🎧 Here is the audio version!")
-
-    os.remove(audio_path)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        await status_msg.edit_text("✅ Download complete. Sending file...")
+        await send_large_file(update, filename)
+    except Exception as e:
+        logging.error(f"Large download failed: {e}")
+        await status_msg.edit_text("❌ Large file download failed.")
 
 async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -222,17 +224,9 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             count = await conn.fetchval("SELECT COUNT(*) FROM users")
             await query.message.reply_text(f"👥 Total users: {count}")
 
-    elif data.startswith("upgrade:"):
-        _, username, days = data.split(":")
-        days = int(days)
-        async with db_pool.acquire() as conn:
-            user = await conn.fetchrow("SELECT * FROM users WHERE LOWER(name) = $1", username.lower())
-            if user:
-                expiry = (datetime.utcnow() + timedelta(days=days)).date()
-                await conn.execute("UPDATE users SET plan='paid', expires=$1 WHERE id=$2", expiry, user["id"])
-                await query.message.reply_text(f"✅ {username} upgraded for {days} days.")
-            else:
-                await query.message.reply_text("❌ User not found.")
+    elif data == "large_file_mode":
+        user_states[user_id] = "awaiting_large_link"
+        await query.message.reply_text("📥 Send the link to the large video now.")
 
 async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -242,14 +236,16 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /upgrade <username>")
         return
     username = context.args[0]
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
-        InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
-        InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
+            InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
+            InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")
+        ]
+    ])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
-# ----------- Webhook Setup -----------
+# ---------- WEBHOOK SETUP ----------
 
 web_app = web.Application()
 
@@ -281,15 +277,14 @@ async def on_cleanup(app):
 web_app.on_startup.append(on_startup)
 web_app.on_cleanup.append(on_cleanup)
 
-# ----------- Register Handlers -----------
+# ---------- REGISTER HANDLERS ----------
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("upgrade", upgrade_user))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
-application.add_handler(CallbackQueryHandler(handle_audio_callback, pattern="^convert_audio:"))
 application.add_handler(CallbackQueryHandler(handle_inline_buttons))
 
-# ----------- Run -----------
+# ---------- RUN ----------
 
 if __name__ == "__main__":
     web.run_app(web_app, port=PORT)
