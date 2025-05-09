@@ -1,3 +1,5 @@
+# main.py
+
 import os
 import re
 import ssl
@@ -5,10 +7,8 @@ import json
 import logging
 import yt_dlp
 import mimetypes
-import requests
-import ffmpeg
-import asyncpg
 import asyncio
+import asyncpg
 from datetime import datetime, timedelta
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,7 +29,7 @@ DB_URL = os.getenv("DATABASE_URL")
 application = Application.builder().token(BOT_TOKEN).build()
 db_pool = None
 user_states = {}
-user_files = {}
+video_files = {}  # key: user_id, value: filepath
 
 # ---------- DB HELPERS ----------
 
@@ -61,15 +61,12 @@ async def update_user(user_id, data):
         user = await get_user(user_id)
         user.update(data)
         downloads_json = json.dumps(user["downloads"])
-        await conn.execute(
-            """
+        await conn.execute("""
             INSERT INTO users (id, name, plan, downloads, expires)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO UPDATE SET
               name = $2, plan = $3, downloads = $4, expires = $5
-            """,
-            user["id"], user["name"], user["plan"], downloads_json, user["expires"]
-        )
+        """, user["id"], user["name"], user["plan"], downloads_json, user["expires"])
 
 async def can_download(user_id):
     user = await get_user(user_id)
@@ -91,7 +88,7 @@ async def log_download(user_id):
     downloads[today] = downloads.get(today, 0) + 1
     await update_user(user_id, {"downloads": downloads})
 
-# ---------- BOT HELPERS ----------
+# ---------- HELPERS ----------
 
 def is_valid_url(text):
     return re.match(r'https?://', text)
@@ -99,12 +96,16 @@ def is_valid_url(text):
 def generate_filename(ext="mp4"):
     return f"video_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
 
-async def auto_delete(file_path, user_id):
-    await asyncio.sleep(60)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    if user_id in user_files and user_files[user_id] == file_path:
-        del user_files[user_id]
+async def delete_file_later(path: str, user_id: int, delay: int = 60):
+    await asyncio.sleep(delay)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+            logging.info(f"Deleted {path}")
+        except Exception as e:
+            logging.warning(f"Failed to delete {path}: {e}")
+    if user_id in video_files and video_files[user_id] == path:
+        video_files.pop(user_id)
 
 # ---------- HANDLERS ----------
 
@@ -112,13 +113,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update_user(user.id, {"name": user.first_name or ""})
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("👤 View Profile", callback_data="profile"),
-        InlineKeyboardButton("🎵 Convert to Audio", callback_data="convert_audio")
-    ]] + ([[InlineKeyboardButton("👥 Total Users", callback_data="total_users")]] if user.id == ADMIN_ID else []))
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
+        [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
+    ])
 
     await update.message.reply_text(
-        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.",
+        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download (max 50MB).",
         reply_markup=keyboard
     )
 
@@ -153,14 +154,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ydl_opts = {
         'progress_hooks': [progress_hook],
         'outtmpl': filename,
-        'format': 'bestvideo+bestaudio/best',
+        'format': 'best[filesize<=52M][ext=mp4]/best[filesize<=52M]/best',
         'merge_output_format': 'mp4',
         'noplaylist': True,
         'quiet': True,
         'geo_bypass': True,
         'nocheckcertificate': True,
         'http_headers': {'User-Agent': 'Mozilla/5.0'},
-        'max_filesize': 50 * 1024 * 1024  # 50 MB
     }
 
     try:
@@ -168,14 +168,16 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ydl.download([url])
         await log_download(user.id)
         await status_msg.edit_text("✅ Download complete.")
-
         with open(filename, 'rb') as f:
-            await update.message.reply_video(f, caption="🎉 Here's your video!")
-        user_files[user.id] = filename
-        context.application.create_task(auto_delete(filename, user.id))
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎧 Convert to Audio", callback_data="convert_audio")]
+            ])
+            await update.message.reply_video(f, caption="🎉 Here's your video!", reply_markup=keyboard)
+        video_files[user.id] = filename
+        asyncio.create_task(delete_file_later(filename, user.id))
     except Exception as e:
         logging.error(f"Download error: {e}")
-        await status_msg.edit_text("⚠️ Download failed. The file may be too large.")
+        await status_msg.edit_text("⚠️ Download failed. File may be too large (limit is 50MB).")
 
 async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -196,21 +198,22 @@ async def handle_inline_buttons(update: Update, context: ContextTypes.DEFAULT_TY
             await query.message.reply_text(f"👥 Total users: {count}")
 
     elif data == "convert_audio":
-        if user_id not in user_files or not os.path.exists(user_files[user_id]):
-            await query.message.reply_text("❌ The file has been deleted. Please resend the video link and convert to audio within 1 minute to avoid loss.")
+        if user_id not in video_files or not os.path.exists(video_files[user_id]):
+            await query.message.reply_text(
+                "❌ The file has been deleted. Please resend the link to download and convert to audio within 1 minute to avoid loss again."
+            )
             return
-
-        video_path = user_files[user_id]
+        video_path = video_files[user_id]
         audio_path = video_path.replace(".mp4", ".mp3")
-
         try:
-            ffmpeg.input(video_path).output(audio_path).run(overwrite_output=True)
+            import ffmpeg
+            ffmpeg.input(video_path).output(audio_path).run(overwrite_output=True, quiet=True)
             with open(audio_path, 'rb') as f:
-                await query.message.reply_audio(f, title="🎧 Your audio is ready!")
+                await query.message.reply_audio(f, caption="🎧 Here's your audio!")
             os.remove(audio_path)
         except Exception as e:
             logging.error(f"Audio conversion error: {e}")
-            await query.message.reply_text("⚠️ Failed to convert to audio.")
+            await query.message.reply_text("⚠️ Audio conversion failed.")
 
 async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -220,11 +223,13 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /upgrade <username>")
         return
     username = context.args[0]
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
-        InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
-        InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
+            InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
+            InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")
+        ]
+    ])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
 # ---------- WEBHOOK SETUP ----------
