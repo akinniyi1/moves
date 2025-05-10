@@ -1,3 +1,4 @@
+# (Keep all your previous imports here)
 import os
 import re
 import ssl
@@ -16,8 +17,6 @@ from telegram.ext import (
 )
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import SearchRequest
-from telethon.tl.types import InputPeerEmpty
 
 ssl._create_default_https_context = ssl._create_unverified_context
 logging.basicConfig(level=logging.INFO)
@@ -38,251 +37,76 @@ db_pool = None
 user_states = {}
 file_registry = {}
 
-# ---------- DB HELPERS ----------
+# --- LIST OF 100+ PUBLIC CHANNELS/GROUPS ---
+SEARCH_CHANNELS = [
+    "https://t.me/s/ai_news_feed", "https://t.me/s/deeplearning_ai", "https://t.me/s/pythontelegrambotchannel",
+    "https://t.me/s/cryptonews", "https://t.me/s/marketing_chat", "https://t.me/s/youtubers", "https://t.me/s/ml_jobs",
+    "https://t.me/s/chatgptprompts", "https://t.me/s/openaiupdates", "https://t.me/s/techguidehub", "https://t.me/s/designresource",
+    "https://t.me/s/worldnewsdaily", "https://t.me/s/dataengineering", "https://t.me/s/freecodecamp", "https://t.me/s/linuxtricks",
+    "https://t.me/s/startupnetwork", "https://t.me/s/devopsdaily", "https://t.me/s/coding_interview", "https://t.me/s/frontendmastery",
+    "https://t.me/s/backendtalks", "https://t.me/s/aiartworks", "https://t.me/s/futuretools", "https://t.me/s/marketingtools",
+    "https://t.me/s/freemoneysources", "https://t.me/s/techbuzz", "https://t.me/s/smallbiztips", "https://t.me/s/devopstips",
+    "https://t.me/s/newsdaily", "https://t.me/s/freetechcourses", "https://t.me/s/jobopps", "https://t.me/s/uxdesign",
+    "https://t.me/s/remotework", "https://t.me/s/aihackers", "https://t.me/s/aiwhisperers", "https://t.me/s/pythonhub",
+    "https://t.me/s/codinghub", "https://t.me/s/aiethics", "https://t.me/s/sidehustle", "https://t.me/s/opensourcebuilders",
+    "https://t.me/s/producthuntfeed", "https://t.me/s/midjourneyart", "https://t.me/s/reactcommunity", "https://t.me/s/androiddev",
+    "https://t.me/s/javascriptdaily", "https://t.me/s/ai_code", "https://t.me/s/linuxchat", "https://t.me/s/ai_engineers",
+    "https://t.me/s/openaisandbox", "https://t.me/s/chatgptdaily", "https://t.me/s/promptshare", "https://t.me/s/prompthackers",
+    "https://t.me/s/makemoneyai", "https://t.me/s/microstartups", "https://t.me/s/gpttools", "https://t.me/s/no_code_builders",
+    "https://t.me/s/cybersecuritydaily", "https://t.me/s/ai_investments", "https://t.me/s/freelancetools", "https://t.me/s/web3builders",
+    "https://t.me/s/botbuilders", "https://t.me/s/ai_imagefeed", "https://t.me/s/ai_videos", "https://t.me/s/marketingmasters",
+    "https://t.me/s/aicontentcreators", "https://t.me/s/startupfounders", "https://t.me/s/gptmarketing", "https://t.me/s/copywritingsecrets",
+    "https://t.me/s/codewithme", "https://t.me/s/datasciencetalk", "https://t.me/s/datainsights", "https://t.me/s/ai_in_action",
+    "https://t.me/s/moneywithai", "https://t.me/s/promptbuilders", "https://t.me/s/techtrends", "https://t.me/s/ai_marketing",
+    "https://t.me/s/techinsight", "https://t.me/s/deeplearninghub", "https://t.me/s/codereviewhub", "https://t.me/s/ai_newsroom",
+    "https://t.me/s/startuptalks", "https://t.me/s/developergrind", "https://t.me/s/aijobsfeed", "https://t.me/s/pythoncodehub",
+    "https://t.me/s/codeprojects", "https://t.me/s/apidevelopers", "https://t.me/s/aiwritingtools", "https://t.me/s/automationbuilders",
+    "https://t.me/s/telegrambots", "https://t.me/s/indiehacker", "https://t.me/s/saasfounders", "https://t.me/s/gptbusiness",
+    "https://t.me/s/toolsdirectory", "https://t.me/s/solopreneurs", "https://t.me/s/promptmastery", "https://t.me/s/aisocialmedia",
+    "https://t.me/s/creatorsai", "https://t.me/s/digitaltools"
+]
 
-async def get_user(user_id):
-    async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-        if not user:
-            await conn.execute(
-                "INSERT INTO users (id, name, plan, downloads, expires) VALUES ($1, $2, $3, $4, $5)",
-                user_id, "", "free", json.dumps({}), None
-            )
-            return {"id": user_id, "name": "", "plan": "free", "downloads": {}, "expires": None}
-        downloads = user["downloads"]
-        if isinstance(downloads, str):
-            try:
-                downloads = json.loads(downloads)
-            except:
-                downloads = {}
-        return {
-            "id": user["id"],
-            "name": user["name"],
-            "plan": user["plan"],
-            "downloads": downloads,
-            "expires": user["expires"]
-        }
+# --- Add this function to search channels manually ---
+async def search_telegram_channels(keyword):
+    results = []
+    await tele_client.start()
+    for link in SEARCH_CHANNELS:
+        try:
+            entity = await tele_client.get_entity(link)
+            async for msg in tele_client.iter_messages(entity, search=keyword, limit=2):
+                if msg.message:
+                    results.append((link, msg.message))
+        except Exception as e:
+            continue
+    return results
 
-async def update_user(user_id, data):
-    async with db_pool.acquire() as conn:
-        user = await get_user(user_id)
-        user.update(data)
-        downloads_json = json.dumps(user["downloads"])
-        await conn.execute(
-            """
-            INSERT INTO users (id, name, plan, downloads, expires)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (id) DO UPDATE SET
-              name = $2, plan = $3, downloads = $4, expires = $5
-            """,
-            user["id"], user["name"], user["plan"], downloads_json, user["expires"]
-        )
-
-async def can_download(user_id):
-    user = await get_user(user_id)
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    downloads_today = user["downloads"].get(today, 0)
-    if user["plan"] == "free":
-        return downloads_today < 3
-    else:
-        expiry = user.get("expires")
-        if expiry and expiry < datetime.utcnow().date():
-            await update_user(user_id, {"plan": "free", "expires": None})
-            return downloads_today < 3
-        return True
-
-async def log_download(user_id):
-    user = await get_user(user_id)
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    downloads = user["downloads"]
-    downloads[today] = downloads.get(today, 0) + 1
-    await update_user(user_id, {"downloads": downloads})
-
-# ---------- UTILS ----------
-
-def is_valid_url(text):
-    return re.match(r'https?://', text)
-
-def generate_filename(ext="mp4"):
-    return f"video_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
-
-async def delete_file_later(file_path, file_id):
-    await asyncio.sleep(60)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    file_registry.pop(file_id, None)
-
-async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path):
-    audio_path = file_path.replace(".mp4", ".mp3")
-    try:
-        ffmpeg.input(file_path).output(audio_path).run(overwrite_output=True)
-        with open(audio_path, 'rb') as f:
-            await update.callback_query.message.reply_audio(f, filename=os.path.basename(audio_path))
-        os.remove(audio_path)
-    except Exception as e:
-        await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
-
-# ---------- HANDLERS ----------
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update_user(user.id, {"name": user.first_name or ""})
-    buttons = [
-        [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
-        [InlineKeyboardButton("🔍 Telegram Keyword Search", callback_data="keyword_search")],
-        [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
-    ]
-    await update.message.reply_text(
-        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
-        "📌 Free users are limited to 3 downloads/day and 50MB max per video.\n"
-        "Use 'Convert to Audio' within 1 minute before the file is deleted.",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    url = update.message.text.strip()
-    if not is_valid_url(url):
-        await update.message.reply_text("❌ That doesn't look like a valid link.")
-        return
-    if not await can_download(user.id):
-        await update.message.reply_text("⛔ You've reached your daily limit.")
-        return
-    filename = generate_filename()
-    status_msg = await update.message.reply_text("📥 Downloading video...")
-    ydl_opts = {
-        'outtmpl': filename,
-        'format': 'bestvideo+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'noplaylist': True,
-        'geo_bypass': True,
-        'nocheckcertificate': True,
-        'http_headers': {'User-Agent': 'Mozilla/5.0'},
-        'max_filesize': 50 * 1024 * 1024  # 50MB
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        await log_download(user.id)
-        with open(filename, 'rb') as f:
-            sent = await update.message.reply_video(
-                f,
-                caption="🎉 Here's your video!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")]])
-            )
-        file_registry[sent.message_id] = filename
-        asyncio.create_task(delete_file_later(filename, sent.message_id))
-        await status_msg.delete()
-    except Exception as e:
-        await status_msg.edit_text("⚠️ Download failed or file too large.")
-
+# --- Inside your handle_button(), update keyword_search block ---
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     data = query.data
-    if data == "profile":
-        user = await get_user(user_id)
-        exp = f"\n⏳ Expires: {user['expires']}" if user["expires"] else ""
-        await query.message.reply_text(f"👤 Name: {user['name']}\n💼 Plan: {user['plan']}{exp}")
-    elif data == "total_users" and user_id == ADMIN_ID:
-        async with db_pool.acquire() as conn:
-            total = await conn.fetchval("SELECT COUNT(*) FROM users")
-            await query.message.reply_text(f"👥 Total users: {total}")
-    elif data.startswith("audio:"):
-        file = data.split("audio:")[1]
-        if not os.path.exists(file):
-            await query.message.reply_text("The file has been deleted. Please resend link to download and convert to audio in 1min to avoid loss again.")
-        else:
-            await convert_to_audio(update, context, file)
-    elif data.startswith("upgrade:"):
-        _, username, days = data.split(":")
-        async with db_pool.acquire() as conn:
-            user = await conn.fetchrow("SELECT * FROM users WHERE name = $1", username)
-            if not user:
-                await query.message.reply_text("❌ User not found.")
-                return
-            expiry = user["expires"] or datetime.utcnow().date()
-            new_expiry = expiry + timedelta(days=int(days))
-            await conn.execute("UPDATE users SET plan = $1, expires = $2 WHERE name = $3", "premium", new_expiry, username)
-            await query.message.reply_text(f"✅ {username} upgraded for {days} days (expires {new_expiry})")
-    elif data == "keyword_search":
-        user_states[user_id] = "awaiting_keyword"
-        await query.message.reply_text("🔤 Please send the keyword to search Telegram public posts.")
 
+    if data == "keyword_search":
+        user_states[user_id] = "awaiting_keyword"
+        await query.message.reply_text("🔤 Please send the keyword to search Telegram public channels.")
+    # (rest of the conditions below...)
+
+# --- Update handle_text() to use the new channel search ---
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
+
     if user_states.get(user_id) == "awaiting_keyword":
         user_states.pop(user_id, None)
-        await update.message.reply_text("🔍 Searching Telegram for your keyword...")
-        results = []
-        try:
-            await tele_client.start()
-            async for msg in tele_client.iter_messages(InputPeerEmpty(), search=text, limit=10):
-                if msg.message:
-                    results.append(msg.message)
-        except Exception:
-            await update.message.reply_text("⚠️ Failed to search. Try again later.")
-            return
+        await update.message.reply_text("🔍 Searching across public channels...")
+        results = await search_telegram_channels(text)
         if results:
-            reply = "\n\n".join(f"📌 {msg}" for msg in results)
-            await update.message.reply_text(f"🔎 Results for '{text}':\n\n{reply[:4000]}")
+            reply = "\n\n".join([f"📌 <b>{msg[:150]}</b>\n🔗 {link}" for link, msg in results[:10]])
+            await update.message.reply_text(reply, parse_mode="HTML")
         else:
-            await update.message.reply_text("❌ No public posts found.")
+            await update.message.reply_text("❌ No matching posts found.")
     else:
         await handle_video(update, context)
 
-async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Not authorized.")
-        return
-    if len(context.args) != 1:
-        await update.message.reply_text("Usage: /upgrade <username>")
-        return
-    username = context.args[0]
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("1 Day", callback_data=f"upgrade:{username}:1"),
-                                      InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
-                                      InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
-                                      InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
-    await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
-
-# ---------- WEBHOOK & STARTUP ----------
-
-web_app = web.Application()
-
-async def webhook_handler(request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.update_queue.put(update)
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-    return web.Response(text="ok")
-
-web_app.router.add_post("/webhook", webhook_handler)
-
-async def on_startup(app):
-    global db_pool
-    db_pool = await asyncpg.create_pool(DB_URL)
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(f"{APP_URL}/webhook")
-    logging.info("✅ Bot started and webhook set.")
-
-async def on_cleanup(app):
-    await application.stop()
-    await application.shutdown()
-    await db_pool.close()
-
-web_app.on_startup.append(on_startup)
-web_app.on_cleanup.append(on_cleanup)
-
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("upgrade", upgrade_user))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-application.add_handler(CallbackQueryHandler(handle_button))
-
-if __name__ == "__main__":
-    web.run_app(web_app, port=PORT)
+# ✅ Everything else in your script stays unchanged below this point.
