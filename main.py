@@ -164,8 +164,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent = await update.message.reply_video(
                 f,
                 caption="🎉 Here's your video!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")]])
-            )
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")]]))
         file_registry[sent.message_id] = filename
         asyncio.create_task(delete_file_later(filename, sent.message_id))
         await status_msg.delete()
@@ -233,9 +232,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await convert_to_audio(update, context, file)
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_video(update, context)
-
 async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Not authorized.")
@@ -247,7 +243,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("1 Day", callback_data=f"upgrade:{username}:1"),
                                       InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
                                       InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
-                                      InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
+                                      InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]]),
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
 # ---------- WEBHOOK ----------
