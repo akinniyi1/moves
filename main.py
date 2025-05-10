@@ -27,7 +27,6 @@ DB_URL = os.getenv("DATABASE_URL")
 
 application = Application.builder().token(BOT_TOKEN).build()
 db_pool = None
-user_states = {}
 file_registry = {}
 image_collections = {}
 pdf_trials = {}
@@ -120,7 +119,7 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await update_user(user.id, {"name": user.first_name or ""})
+    await update_user(user.id, {"name": user.username or user.first_name})
     buttons = [
         [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
          InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
@@ -232,9 +231,18 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("File deleted. Please resend the link to download again.")
         else:
             await convert_to_audio(update, context, file)
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await handle_video(update, context)
+    elif data.startswith("upgrade:"):
+        _, username, days = data.split(":")
+        days = int(days)
+        async with db_pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT * FROM users WHERE name = $1", username)
+            if not user:
+                await query.message.reply_text("❌ User not found.")
+                return
+            expires = datetime.utcnow().date() + timedelta(days=days)
+            await update_user(user["id"], {"plan": "premium", "expires": expires})
+            await query.message.reply_text(f"✅ Upgraded {username} for {days} days.")
+            await application.bot.send_message(user["id"], f"🎉 Your plan was upgraded for {days} days!")
 
 async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -247,7 +255,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("1 Day", callback_data=f"upgrade:{username}:1"),
                                       InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
                                       InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
-                                      InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]] )
+                                      InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
 # ---------- WEBHOOK ----------
@@ -277,15 +285,15 @@ async def on_cleanup(app):
     await application.stop()
     await application.shutdown()
     await db_pool.close()
-
-web_app.on_startup.append(on_startup)
-web_app.on_cleanup.append(on_cleanup)
-
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("upgrade", upgrade_user))
-application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-application.add_handler(CallbackQueryHandler(handle_button))
+    logging.info("❌ Bot stopped.")
 
 if __name__ == "__main__":
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("upgrade", upgrade_user))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(CallbackQueryHandler(handle_button))
+
+    web_app.on_startup.append(on_startup)
+    web_app.on_cleanup.append(on_cleanup)
     web.run_app(web_app, port=PORT)
