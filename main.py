@@ -7,9 +7,9 @@ import yt_dlp
 import ffmpeg
 import asyncio
 import asyncpg
-import aiohttp
 from datetime import datetime, timedelta
-from aiohttp import web
+from aiohttp import web, ClientSession
+from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -111,34 +111,30 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
         with open(audio_path, 'rb') as f:
             await update.callback_query.message.reply_audio(f, filename=os.path.basename(audio_path))
         os.remove(audio_path)
-    except:
+    except Exception:
         await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
 
-# ---------- GOOGLE MAPS SCRAPER ----------
-
-async def scrape_google_maps(query):
-    url = f"https://www.google.com/search?q={query.replace(' ', '+')}+site:maps.google.com"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    async with aiohttp.ClientSession() as session:
+async def scrape_yelp(query):
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    url = f"https://www.yelp.com/search?find_desc={query.replace(' ', '+')}"
+    results = []
+    async with ClientSession() as session:
         async with session.get(url, headers=headers) as resp:
             html = await resp.text()
+            soup = BeautifulSoup(html, "html.parser")
+            listings = soup.select('div[class*=container__09f24__21w3G]')[:10]
+            for item in listings:
+                name_tag = item.select_one('a[href*="/biz/"]')
+                name = name_tag.text if name_tag else None
+                address_tag = item.select_one('address')
+                website_tag = item.find('a', href=True, text="Business website")
+                rating_tag = item.select_one('[aria-label*="star rating"]')
 
-    business_pattern = re.findall(r'<div class="BNeawe deIvCb AP7Wnd">(.+?)</div>', html)
-    address_pattern = re.findall(r'<div class="BNeawe tAd8D AP7Wnd">(.+?)</div>', html)
-    links = re.findall(r"https://www\.google\.com/maps/place/[^\"']+", html)
-
-    seen = set()
-    results = []
-
-    for i in range(min(len(business_pattern), 10)):
-        name = business_pattern[i]
-        address = address_pattern[i] if i < len(address_pattern) else "No address"
-        link = links[i] if i < len(links) else "No link"
-        if name not in seen:
-            seen.add(name)
-            results.append(f"🏢 <b>{name}</b>\n📍 {address}\n🔗 {link}")
-
-    return results if results else ["❌ No results found."]
+                if name and address_tag:
+                    results.append(f"🏢 {name}\n📍 {address_tag.text.strip()}"
+                                   + (f"\n🌐 {website_tag['href']}" if website_tag else "")
+                                   + (f"\n⭐ {rating_tag['aria-label']}" if rating_tag else ""))
+    return results
 
 # ---------- HANDLERS ----------
 
@@ -147,14 +143,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_user(user.id, {"name": user.first_name or ""})
     buttons = [
         [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
-        [InlineKeyboardButton("🌐 Google Maps Search", callback_data="maps_search")],
+        [InlineKeyboardButton("🔍 Business Search", callback_data="yelp_search")],
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ]
     await update.message.reply_text(
         f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
-        "📌 Free users: 3 downloads/day & max 50MB per video.\n"
-        "Use 'Convert to Audio' within 1 minute before file is auto-deleted.\n\n"
-        "You can also explore businesses via 🌐 Google Maps search!",
+        "📌 Free users are limited to 3 downloads/day and 50MB max per video.\n"
+        "Use 'Convert to Audio' within 1 minute before the file is deleted.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -193,7 +188,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_registry[sent.message_id] = filename
         asyncio.create_task(delete_file_later(filename, sent.message_id))
         await status_msg.delete()
-    except:
+    except Exception:
         await status_msg.edit_text("⚠️ Download failed or file too large.")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -212,22 +207,36 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("audio:"):
         file = data.split("audio:")[1]
         if not os.path.exists(file):
-            await query.message.reply_text("File deleted. Please resend the link to download again.")
+            await query.message.reply_text("The file has been deleted. Please resend link to download and convert to audio in 1min to avoid loss again.")
         else:
             await convert_to_audio(update, context, file)
-    elif data == "maps_search":
-        user_states[user_id] = "awaiting_maps_query"
-        await query.message.reply_text("🌐 Enter a business search query (e.g., 'cafes in Berlin'):")
+    elif data.startswith("upgrade:"):
+        _, username, days = data.split(":")
+        async with db_pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT * FROM users WHERE name = $1", username)
+            if not user:
+                await query.message.reply_text("❌ User not found.")
+                return
+            expiry = user["expires"] or datetime.utcnow().date()
+            new_expiry = expiry + timedelta(days=int(days))
+            await conn.execute("UPDATE users SET plan = $1, expires = $2 WHERE name = $3", "premium", new_expiry, username)
+            await query.message.reply_text(f"✅ {username} upgraded for {days} days (expires {new_expiry})")
+    elif data == "yelp_search":
+        user_states[user_id] = "awaiting_yelp"
+        await query.message.reply_text("🔤 Send a business type and location (e.g. 'restaurants in Lagos').")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
-    if user_states.get(user_id) == "awaiting_maps_query":
+    if user_states.get(user_id) == "awaiting_yelp":
         user_states.pop(user_id, None)
-        await update.message.reply_text("🔎 Searching Google Maps...")
-        results = await scrape_google_maps(text)
-        for result in results[:10]:
-            await update.message.reply_text(result, parse_mode="HTML")
+        await update.message.reply_text("🔎 Searching Yelp...")
+        results = await scrape_yelp(text)
+        if results:
+            reply = "\n\n".join(results)
+            await update.message.reply_text(f"📍 Results for '{text}':\n\n{reply[:4000]}")
+        else:
+            await update.message.reply_text("❌ No results found.")
     else:
         await handle_video(update, context)
 
@@ -245,7 +254,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
-# ---------- WEBHOOK ----------
+# ---------- WEBHOOK & STARTUP ----------
 
 web_app = web.Application()
 
