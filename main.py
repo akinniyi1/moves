@@ -16,8 +16,7 @@ from telegram.ext import (
 )
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.tl.functions.messages import SearchRequest
-from telethon.tl.types import InputPeerEmpty
+from telethon.tl.functions.messages import GetHistoryRequest
 
 ssl._create_default_https_context = ssl._create_unverified_context
 logging.basicConfig(level=logging.INFO)
@@ -37,6 +36,23 @@ application = Application.builder().token(BOT_TOKEN).build()
 db_pool = None
 user_states = {}
 file_registry = {}
+
+GROUPS = [
+    "thepythoncode", "programmingtalks", "learnprogramming", "pythontelegram", "codehub", "python_codes",
+    "webdev", "techguide", "datasciencechat", "machinelearningchat", "developer_chat", "deeplearning_ai",
+    "cyber_security_chat", "linuxchat", "freelancechat", "techupdates", "opensourcechannel", "coding4you",
+    "androiddev", "flutterdev", "gamedev", "web3chat", "aihub", "djangochat", "reactjschat", "codingtalks",
+    "pythonjobs", "mljobs", "remoteworkchat", "codingcommunity", "codingbuddies", "techcareers", "chatgptcommunity",
+    "techstartups", "openaiupdates", "softwaretesting", "cloudcomputinghub", "devtools", "linuxcommands",
+    "codingarena", "iotcommunity", "datasciencenews", "blockchainhub", "kuberneteschat", "fullstackdevs",
+    "backendengineers", "frontendchat", "techmemes", "aiandyou", "programmers_life", "devopslife",
+    "remoteworkers", "learnai", "javaprogramming", "typescriptdev", "vuejsclub", "nextjscommunity",
+    "pythontutorials", "codingresources", "gitlabchat", "stackchat", "programminghub", "pythoncommunity",
+    "coderesources", "pycoder", "sqllearning", "learnlinux", "linuxtricks", "programminghelpline",
+    "devmentors", "hackathonhub", "dockercommunity", "datastructures", "leetcodesolutions", "csstudents",
+    "programmingstudents", "ethicalhackers", "computerscienceclass", "devcareer", "careerindev", "aiinsights",
+    "techtipsdaily", "pythonlessons", "apilearning", "developersden", "frontendtricks", "buildinpublic"
+]
 
 # ---------- DB HELPERS ----------
 
@@ -119,7 +135,7 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
         with open(audio_path, 'rb') as f:
             await update.callback_query.message.reply_audio(f, filename=os.path.basename(audio_path))
         os.remove(audio_path)
-    except:
+    except Exception:
         await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
 
 # ---------- HANDLERS ----------
@@ -134,8 +150,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(
         f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
-        "📌 Free users are limited to 3 downloads/day and 50MB max per video.\n"
-        "Use 'Convert to Audio' within 1 minute before the file is deleted.",
+        "📌 Free users: 3 downloads/day, 50MB limit.\n"
+        "🎧 Use 'Convert to Audio' within 1 min or file is auto-deleted.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -159,7 +175,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'geo_bypass': True,
         'nocheckcertificate': True,
         'http_headers': {'User-Agent': 'Mozilla/5.0'},
-        'max_filesize': 50 * 1024 * 1024  # 50MB
+        'max_filesize': 50 * 1024 * 1024
     }
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -174,7 +190,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_registry[sent.message_id] = filename
         asyncio.create_task(delete_file_later(filename, sent.message_id))
         await status_msg.delete()
-    except Exception as e:
+    except Exception:
         await status_msg.edit_text("⚠️ Download failed or file too large.")
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -193,7 +209,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("audio:"):
         file = data.split("audio:")[1]
         if not os.path.exists(file):
-            await query.message.reply_text("The file has been deleted. Please resend link to download and convert to audio in 1min to avoid loss again.")
+            await query.message.reply_text("The file has been deleted. Please resend the link.")
         else:
             await convert_to_audio(update, context, file)
     elif data.startswith("upgrade:"):
@@ -209,28 +225,45 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(f"✅ {username} upgraded for {days} days (expires {new_expiry})")
     elif data == "keyword_search":
         user_states[user_id] = "awaiting_keyword"
-        await query.message.reply_text("🔤 Please send the keyword to search Telegram public posts.")
+        await query.message.reply_text("🔤 Send a keyword to search Telegram public posts...")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = update.message.text.strip()
     if user_states.get(user_id) == "awaiting_keyword":
         user_states.pop(user_id, None)
-        await update.message.reply_text("🔍 Searching Telegram for your keyword...")
+        await update.message.reply_text("🔍 Searching across public groups...")
         results = []
         try:
             await tele_client.start()
-            async for msg in tele_client.iter_messages(InputPeerEmpty(), search=text, limit=10):
-                if msg.message:
-                    results.append(msg.message)
-        except Exception:
+            for group in GROUPS:
+                try:
+                    entity = await tele_client.get_entity(group)
+                    history = await tele_client(GetHistoryRequest(
+                        peer=entity,
+                        limit=5,
+                        offset_date=None,
+                        offset_id=0,
+                        max_id=0,
+                        min_id=0,
+                        add_offset=0,
+                        hash=0
+                    ))
+                    for msg in history.messages:
+                        if text.lower() in (msg.message or "").lower():
+                            link = f"https://t.me/{group}/{msg.id}"
+                            snippet = msg.message.strip().split("\n")[0][:100]
+                            results.append(f"📌 [{snippet}]({link})")
+                        if len(results) >= 10:
+                            break
+                except:
+                    continue
+            if results:
+                await update.message.reply_text("\n\n".join(results), parse_mode="Markdown", disable_web_page_preview=True)
+            else:
+                await update.message.reply_text("❌ No matching public posts found.")
+        except Exception as e:
             await update.message.reply_text("⚠️ Failed to search. Try again later.")
-            return
-        if results:
-            reply = "\n\n".join(f"📌 {msg}" for msg in results)
-            await update.message.reply_text(f"🔎 Results for '{text}':\n\n{reply[:4000]}")
-        else:
-            await update.message.reply_text("❌ No public posts found.")
     else:
         await handle_video(update, context)
 
@@ -248,7 +281,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
-# ---------- WEBHOOK & STARTUP ----------
+# ---------- WEBHOOK ----------
 
 web_app = web.Application()
 
