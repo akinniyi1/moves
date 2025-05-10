@@ -8,13 +8,13 @@ import ffmpeg
 import asyncio
 import asyncpg
 from datetime import datetime, timedelta
-from aiohttp import web, ClientSession
-from bs4 import BeautifulSoup
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from aiohttp import web
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
+from PIL import Image
 
 ssl._create_default_https_context = ssl._create_unverified_context
 logging.basicConfig(level=logging.INFO)
@@ -28,6 +28,7 @@ DB_URL = os.getenv("DATABASE_URL")
 application = Application.builder().token(BOT_TOKEN).build()
 db_pool = None
 user_states = {}
+user_images = {}
 file_registry = {}
 
 # ---------- DB HELPERS ----------
@@ -96,7 +97,7 @@ def is_valid_url(text):
     return re.match(r'https?://', text)
 
 def generate_filename(ext="mp4"):
-    return f"video_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
+    return f"file_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
 
 async def delete_file_later(file_path, file_id):
     await asyncio.sleep(60)
@@ -111,30 +112,35 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
         with open(audio_path, 'rb') as f:
             await update.callback_query.message.reply_audio(f, filename=os.path.basename(audio_path))
         os.remove(audio_path)
-    except Exception:
+    except:
         await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
 
-async def scrape_yelp(query):
-    headers = {'User-Agent': 'Mozilla/5.0'}
-    url = f"https://www.yelp.com/search?find_desc={query.replace(' ', '+')}"
-    results = []
-    async with ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            html = await resp.text()
-            soup = BeautifulSoup(html, "html.parser")
-            listings = soup.select('div[class*=container__09f24__21w3G]')[:10]
-            for item in listings:
-                name_tag = item.select_one('a[href*="/biz/"]')
-                name = name_tag.text if name_tag else None
-                address_tag = item.select_one('address')
-                website_tag = item.find('a', href=True, text="Business website")
-                rating_tag = item.select_one('[aria-label*="star rating"]')
+# ---------- IMAGE TO PDF FEATURE ----------
 
-                if name and address_tag:
-                    results.append(f"🏢 {name}\n📍 {address_tag.text.strip()}"
-                                   + (f"\n🌐 {website_tag['href']}" if website_tag else "")
-                                   + (f"\n⭐ {rating_tag['aria-label']}" if rating_tag else ""))
-    return results
+async def convert_images_to_pdf(user_id, update: Update):
+    images = user_images.get(user_id, [])
+    if not images:
+        await update.message.reply_text("❗ You haven't sent any images.")
+        return
+    pil_images = []
+    for img_path in images:
+        try:
+            image = Image.open(img_path).convert("RGB")
+            pil_images.append(image)
+        except Exception as e:
+            logging.warning(f"Failed to process image: {e}")
+    if not pil_images:
+        await update.message.reply_text("❌ Could not process your images.")
+        return
+    pdf_path = f"document_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.pdf"
+    pil_images[0].save(pdf_path, save_all=True, append_images=pil_images[1:])
+    with open(pdf_path, "rb") as f:
+        await update.message.reply_document(f, filename="converted.pdf")
+    os.remove(pdf_path)
+    for img in images:
+        if os.path.exists(img):
+            os.remove(img)
+    user_images[user_id] = []
 
 # ---------- HANDLERS ----------
 
@@ -143,13 +149,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_user(user.id, {"name": user.first_name or ""})
     buttons = [
         [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
-        [InlineKeyboardButton("🔍 Business Search", callback_data="yelp_search")],
+        [InlineKeyboardButton("🖼️ Convert Images to PDF", callback_data="pdf_start")],
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ]
     await update.message.reply_text(
         f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
-        "📌 Free users are limited to 3 downloads/day and 50MB max per video.\n"
-        "Use 'Convert to Audio' within 1 minute before the file is deleted.",
+        "📌 Free users: 3 downloads/day & max 50MB per video.\n"
+        "Use 'Convert to Audio' within 1 minute before file is auto-deleted.\n\n"
+        "You can also convert multiple images to a PDF using the menu.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -188,8 +195,25 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_registry[sent.message_id] = filename
         asyncio.create_task(delete_file_later(filename, sent.message_id))
         await status_msg.delete()
-    except Exception:
+    except:
         await status_msg.edit_text("⚠️ Download failed or file too large.")
+
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in user_images:
+        user_images[user_id] = []
+    photo = update.message.photo[-1]
+    file = await context.bot.get_file(photo.file_id)
+    filename = f"img_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.jpg"
+    await file.download_to_drive(filename)
+    user_images[user_id].append(filename)
+    await update.message.reply_text("🖼️ Image saved. Send more or use /convertpdf when ready.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text.lower() == "/convertpdf":
+        await convert_images_to_pdf(update.effective_user.id, update)
+    else:
+        await handle_video(update, context)
 
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -207,38 +231,12 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("audio:"):
         file = data.split("audio:")[1]
         if not os.path.exists(file):
-            await query.message.reply_text("The file has been deleted. Please resend link to download and convert to audio in 1min to avoid loss again.")
+            await query.message.reply_text("File deleted. Please resend the link to download again.")
         else:
             await convert_to_audio(update, context, file)
-    elif data.startswith("upgrade:"):
-        _, username, days = data.split(":")
-        async with db_pool.acquire() as conn:
-            user = await conn.fetchrow("SELECT * FROM users WHERE name = $1", username)
-            if not user:
-                await query.message.reply_text("❌ User not found.")
-                return
-            expiry = user["expires"] or datetime.utcnow().date()
-            new_expiry = expiry + timedelta(days=int(days))
-            await conn.execute("UPDATE users SET plan = $1, expires = $2 WHERE name = $3", "premium", new_expiry, username)
-            await query.message.reply_text(f"✅ {username} upgraded for {days} days (expires {new_expiry})")
-    elif data == "yelp_search":
-        user_states[user_id] = "awaiting_yelp"
-        await query.message.reply_text("🔤 Send a business type and location (e.g. 'restaurants in Lagos').")
-
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    if user_states.get(user_id) == "awaiting_yelp":
-        user_states.pop(user_id, None)
-        await update.message.reply_text("🔎 Searching Yelp...")
-        results = await scrape_yelp(text)
-        if results:
-            reply = "\n\n".join(results)
-            await update.message.reply_text(f"📍 Results for '{text}':\n\n{reply[:4000]}")
-        else:
-            await update.message.reply_text("❌ No results found.")
-    else:
-        await handle_video(update, context)
+    elif data == "pdf_start":
+        user_images[user_id] = []
+        await query.message.reply_text("📸 Send all the images you want to combine into one PDF.\nWhen done, send /convertpdf.")
 
 async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -254,7 +252,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
-# ---------- WEBHOOK & STARTUP ----------
+# ---------- WEBHOOK ----------
 
 web_app = web.Application()
 
@@ -287,6 +285,8 @@ web_app.on_cleanup.append(on_cleanup)
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("upgrade", upgrade_user))
+application.add_handler(CommandHandler("convertpdf", convert_images_to_pdf))
+application.add_handler(MessageHandler(filters.PHOTO, handle_image))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 application.add_handler(CallbackQueryHandler(handle_button))
 
