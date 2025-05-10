@@ -4,4 +4,3 @@ aiohttp
 ffmpeg-python
 requests
 asyncpg
-telethon
