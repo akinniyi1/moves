@@ -14,6 +14,10 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters
 )
+from telethon import TelegramClient
+from telethon.sessions import StringSession
+from telethon.tl.functions.messages import SearchRequest
+from telethon.tl.types import InputPeerEmpty
 
 ssl._create_default_https_context = ssl._create_unverified_context
 logging.basicConfig(level=logging.INFO)
@@ -23,6 +27,11 @@ APP_URL = os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", 10000))
 ADMIN_ID = 1378825382
 DB_URL = os.getenv("DATABASE_URL")
+
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
+SESSION_STRING = os.getenv("SESSION_STRING")
+tele_client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
 
 application = Application.builder().token(BOT_TOKEN).build()
 db_pool = None
@@ -120,10 +129,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update_user(user.id, {"name": user.first_name or ""})
     buttons = [
         [InlineKeyboardButton("👤 View Profile", callback_data="profile")],
+        [InlineKeyboardButton("🔍 Telegram Keyword Search", callback_data="keyword_search")],
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ]
     await update.message.reply_text(
-        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.",
+        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
+        "📌 Free users are limited to 3 downloads/day and 50MB max per video.\n"
+        "Use 'Convert to Audio' within 1 minute before the file is deleted.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -157,9 +169,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent = await update.message.reply_video(
                 f,
                 caption="🎉 Here's your video!",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")
-                ]])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")]])
             )
         file_registry[sent.message_id] = filename
         asyncio.create_task(delete_file_later(filename, sent.message_id))
@@ -197,6 +207,32 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_expiry = expiry + timedelta(days=int(days))
             await conn.execute("UPDATE users SET plan = $1, expires = $2 WHERE name = $3", "premium", new_expiry, username)
             await query.message.reply_text(f"✅ {username} upgraded for {days} days (expires {new_expiry})")
+    elif data == "keyword_search":
+        user_states[user_id] = "awaiting_keyword"
+        await query.message.reply_text("🔤 Please send the keyword to search Telegram public posts.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    if user_states.get(user_id) == "awaiting_keyword":
+        user_states.pop(user_id, None)
+        await update.message.reply_text("🔍 Searching Telegram for your keyword...")
+        results = []
+        try:
+            await tele_client.start()
+            async for msg in tele_client.iter_messages(InputPeerEmpty(), search=text, limit=10):
+                if msg.message:
+                    results.append(msg.message)
+        except Exception:
+            await update.message.reply_text("⚠️ Failed to search. Try again later.")
+            return
+        if results:
+            reply = "\n\n".join(f"📌 {msg}" for msg in results)
+            await update.message.reply_text(f"🔎 Results for '{text}':\n\n{reply[:4000]}")
+        else:
+            await update.message.reply_text("❌ No public posts found.")
+    else:
+        await handle_video(update, context)
 
 async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -206,12 +242,10 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /upgrade <username>")
         return
     username = context.args[0]
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("1 Day", callback_data=f"upgrade:{username}:1"),
-        InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
-        InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
-        InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")
-    ]])
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("1 Day", callback_data=f"upgrade:{username}:1"),
+                                      InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
+                                      InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
+                                      InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
 # ---------- WEBHOOK & STARTUP ----------
@@ -247,8 +281,8 @@ web_app.on_cleanup.append(on_cleanup)
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("upgrade", upgrade_user))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 application.add_handler(CallbackQueryHandler(handle_button))
 
-import telethon_login
-
+if __name__ == "__main__":
+    web.run_app(web_app, port=PORT)
