@@ -375,7 +375,6 @@ async def handle_youtube_link_button(update: Update, context: ContextTypes.DEFAU
     video_id = query.data.split("ytlink:")[1]
     url = f"https://youtu.be/{video_id}"
     await query.message.reply_text(f"📺 You selected:\nhttps://youtu.be/{video_id}")
-{url}")
 
 
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_youtube_keyword))
