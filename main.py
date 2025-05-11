@@ -31,7 +31,7 @@ db_pool = None
 file_registry = {}
 image_collections = {}
 pdf_trials = {}
-
+upgrade_context = {}
 # --- [HELPERS] ---
 def is_valid_url(text):
     return re.match(r'https?://', text)
@@ -116,40 +116,28 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
     except:
         await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
 
-# --- [HANDLERS] ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    await update_user(user.id, {"name": user.username or ""})
-    buttons = [
-        [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
-         InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
-        [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
-    ]
-    await update.message.reply_text(
-        f"👋 Hello @{user.username or 'user'}! Send me a video link to download.\n\n"
-        "📌 Free plan: 3 video downloads/day, 1 PDF trial.\n",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     url = update.message.text.strip()
     if not is_valid_url(url):
-        await update.message.reply_text("❌ Please send a valid video link.")
+        await update.message.reply_text("❌ Invalid URL.")
         return
     if not await can_download(user.id):
         await update.message.reply_text("⛔ Daily limit reached.")
         return
     filename = generate_filename()
     status_msg = await update.message.reply_text("📥 Downloading...")
+
     ydl_opts = {
         'outtmpl': filename,
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'quiet': True,
         'noplaylist': True,
-        'max_filesize': 50 * 1024 * 1024
+        'max_filesize': 50 * 1024 * 1024,
+        'geo_bypass': True
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -163,43 +151,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_registry[sent.message_id] = filename
         asyncio.create_task(delete_file_later(filename, sent.message_id))
         await status_msg.delete()
-    except:
-        await status_msg.edit_text("⚠️ Download failed or file too large.")
+    except Exception as e:
+        logging.error(e)
+        await status_msg.edit_text("⚠️ Download failed or file too large or unsupported.")
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-    if data == "profile":
-        user = await get_user(user_id)
-        exp = f"\n⏳ Expires: {user['expires']}" if user["expires"] else ""
-        await query.message.reply_text(f"👤 Username: @{user['name']}\n💼 Plan: {user['plan']}{exp}")
-    elif data == "total_users" and user_id == ADMIN_ID:
-        async with db_pool.acquire() as conn:
-            total = await conn.fetchval("SELECT COUNT(*) FROM users")
-            await query.message.reply_text(f"👥 Total users: {total}")
-    elif data == "convertpdf_btn":
-        fake_msg = type("msg", (), {"message": query.message, "effective_user": query.from_user})
-        await convert_pdf(fake_msg, context, triggered_by_button=True)
-    elif data.startswith("audio:"):
-        file = data.split("audio:")[1]
-        if not os.path.exists(file):
-            await query.message.reply_text("File deleted. Please resend the link.")
-        else:
-            await convert_to_audio(update, context, file)
-    elif data.startswith("upgrade:"):
-        _, username, days = data.split(":")
-        async with db_pool.acquire() as conn:
-            user_row = await conn.fetchrow("SELECT * FROM users WHERE name = $1", username)
-            if user_row:
-                user_id_to_upgrade = user_row["id"]
-                expire_date = datetime.utcnow().date() + timedelta(days=int(days))
-                await conn.execute("UPDATE users SET plan = 'pro', expires = $1 WHERE id = $2", expire_date, user_id_to_upgrade)
-                await query.message.reply_text(f"✅ @{username} upgraded to Pro for {days} days.")
-            else:
-                await query.message.reply_text("❌ User not found.")
-
+# --- [PDF CONVERSION] ---
 async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, triggered_by_button=False):
     user_id = update.effective_user.id
     user = await get_user(user_id)
@@ -225,6 +181,21 @@ async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, trigge
     except:
         await update.message.reply_text("❌ Failed to generate PDF.")
 
+# --- [START & PHOTO HANDLER] ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update_user(user.id, {"name": user.username or user.first_name or ""})
+    buttons = [
+        [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
+         InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
+        [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
+    ]
+    await update.message.reply_text(
+        f"👋 Hello @{user.username or user.first_name}! Send me a video link.\n\n"
+        "📌 Free Plan: 3 video downloads/day, 1 PDF conversion.\n",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     photo = update.message.photo[-1]
@@ -236,6 +207,42 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_collections[user_id].append(image_path)
     await update.message.reply_text("✅ Image received. Send more or convert to PDF.")
 
+# --- [BUTTON HANDLER] ---
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = query.data
+    if data == "profile":
+        user = await get_user(user_id)
+        exp = f"\n⏳ Expires: {user['expires']}" if user["expires"] else ""
+        await query.message.reply_text(f"👤 Name: {user['name']}\n💼 Plan: {user['plan']}{exp}")
+    elif data == "total_users" and user_id == ADMIN_ID:
+        async with db_pool.acquire() as conn:
+            total = await conn.fetchval("SELECT COUNT(*) FROM users")
+            await query.message.reply_text(f"👥 Total users: {total}")
+    elif data == "convertpdf_btn":
+        fake_msg = type("msg", (), {"message": query.message, "effective_user": query.from_user})
+        await convert_pdf(fake_msg, context, triggered_by_button=True)
+    elif data.startswith("audio:"):
+        file = data.split("audio:")[1]
+        if not os.path.exists(file):
+            await query.message.reply_text("File deleted. Please resend the link.")
+        else:
+            await convert_to_audio(update, context, file)
+    elif data.startswith("upgrade:"):
+        _, username, days = data.split(":")
+        days = int(days)
+        async with db_pool.acquire() as conn:
+            user = await conn.fetchrow("SELECT * FROM users WHERE name = $1", username)
+            if user:
+                new_expiry = datetime.utcnow().date() + timedelta(days=days)
+                await update_user(user["id"], {"plan": "premium", "expires": new_expiry})
+                await query.message.reply_text(f"✅ {username} upgraded for {days} day(s).")
+            else:
+                await query.message.reply_text("❌ Username not found.")
+
+# --- [UPGRADE COMMAND] ---
 async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Not authorized.")
@@ -248,9 +255,9 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
                                       InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
                                       InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
-    await update.message.reply_text(f"Select upgrade duration for @{username}:", reply_markup=keyboard)
+    await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
-# --- [WEBHOOK SETUP] ---
+# --- [WEBHOOK DEPLOYMENT] ---
 web_app = web.Application()
 
 async def webhook_handler(request):
