@@ -31,7 +31,6 @@ db_pool = None
 file_registry = {}
 image_collections = {}
 pdf_trials = {}
-music_trials = {}
 
 # --- [HELPERS] ---
 def is_valid_url(text):
@@ -127,9 +126,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ]
     await update.message.reply_text(
-        f"👋 Hello {user.first_name or 'there'}! Send me a video link or music name.\n\n"
-        "🎵 Send artist or song name to download music (1 free trial).\n"
-        "📌 Free: 3 video downloads/day, 1 music download, 1 PDF trial.\n",
+        f"👋 Hello @{user.username or 'there'}! Send me a video link to download.\n\n"
+        "📌 Free users get:\n• 3 video downloads/day\n• 1 PDF conversion trial\n• Max 50MB video size\n",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -137,10 +135,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     url = update.message.text.strip()
     if not is_valid_url(url):
-        await search_youtube_audio(update, context)
+        await update.message.reply_text("❌ Please send a valid video URL.")
         return
     if not await can_download(user.id):
-        await update.message.reply_text("⛔ Daily limit reached.")
+        await update.message.reply_text("⛔ Daily download limit reached.")
         return
     filename = generate_filename()
     status_msg = await update.message.reply_text("📥 Downloading...")
@@ -168,40 +166,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await status_msg.edit_text("⚠️ Download failed or file too large.")
 
-async def search_youtube_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if await get_user(user_id) and music_trials.get(user_id, 0) >= 1:
-        await update.message.reply_text("⛔ Free users can download music only once.")
-        return
-    query = update.message.text.strip()
-    if not query:
-        await update.message.reply_text("❌ Please send a song or artist name.")
-        return
-    await update.message.reply_text(f"🎶 Searching for \"{query}\"...")
-    filename = generate_filename("mp3")
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'quiet': True,
-        'noplaylist': True,
-        'default_search': 'ytsearch1',
-        'outtmpl': filename,
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }]
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([query])
-        with open(filename, 'rb') as f:
-            await update.message.reply_audio(f, filename=os.path.basename(filename), caption="🎧 Music downloaded!")
-        asyncio.create_task(delete_file_later(filename))
-        music_trials[user_id] = 1
-    except Exception as e:
-        logging.error(e)
-        await update.message.reply_text("❌ Failed to download music.")
-
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -210,7 +174,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "profile":
         user = await get_user(user_id)
         exp = f"\n⏳ Expires: {user['expires']}" if user["expires"] else ""
-        await query.message.reply_text(f"👤 Name: {user['name']}\n💼 Plan: {user['plan']}{exp}")
+        await query.message.reply_text(f"👤 Username: {user['name']}\n💼 Plan: {user['plan']}{exp}")
     elif data == "total_users" and user_id == ADMIN_ID:
         async with db_pool.acquire() as conn:
             total = await conn.fetchval("SELECT COUNT(*) FROM users")
@@ -305,11 +269,13 @@ async def on_cleanup(app):
 web_app.on_startup.append(on_startup)
 web_app.on_cleanup.append(on_cleanup)
 
+# --- [HANDLERS] ---
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("upgrade", upgrade_user))
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
 application.add_handler(CallbackQueryHandler(handle_button))
 
+# --- [RUN SERVER] ---
 if __name__ == "__main__":
     web.run_app(web_app, port=PORT)
