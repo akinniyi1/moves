@@ -122,7 +122,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update_user(user.id, {"name": user.username or user.first_name or ""})
     buttons = [
-        [InlineKeyboardButton("🔍 Search YouTube Video", callback_data="yt_search")],
         [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
          InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
@@ -314,69 +313,3 @@ application.add_handler(CallbackQueryHandler(handle_button))
 
 if __name__ == "__main__":
     web.run_app(web_app, port=PORT)
-
-
-
-# --- [YOUTUBE SEARCH REPLACEMENT FOR MUSIC FEATURE] ---
-from yt_dlp import YoutubeDL
-
-yt_search_trials = {}  # In-memory tracking
-
-async def search_youtube_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = await get_user(user_id)
-    if user['plan'] == 'free' and yt_search_trials.get(user_id, 0) >= 1:
-        await update.message.reply_text("⛔ Free users can only search YouTube once. Upgrade to unlock full access.")
-        return
-
-    query = update.message.text.strip()
-    if not query:
-        await update.message.reply_text("❌ Please enter a search keyword.")
-        return
-
-    await update.message.reply_text(f"🔍 Searching YouTube for "{query}"...")
-
-    ydl_opts = {
-        'quiet': True,
-        'noplaylist': True,
-        'default_search': 'ytsearch3',
-        'extract_flat': True,
-        'skip_download': True,
-    }
-
-    try:
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-            results = info.get('entries', [])
-
-        if not results:
-            await update.message.reply_text("❌ No results found.")
-            return
-
-        keyboard = []
-        for i, entry in enumerate(results[:3]):
-            title = entry.get("title", "No Title")[:40]
-            video_id = entry.get("id")
-            callback_data = f"ytlink:{video_id}"
-            keyboard.append([InlineKeyboardButton(f"{i+1}. {title}", callback_data=callback_data)])
-
-        await update.message.reply_text("🎥 Select a video:", reply_markup=InlineKeyboardMarkup(keyboard))
-
-        if user["plan"] == "free":
-            yt_search_trials[user_id] = 1
-
-    except Exception as e:
-        logging.error(f"YT Search failed: {e}")
-        await update.message.reply_text("❌ Failed to perform YouTube search.")
-
-async def handle_youtube_link_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    video_id = query.data.split("ytlink:")[1]
-    url = f"https://youtu.be/{video_id}"
-    await query.message.reply_text(f"📺 You selected:
-{url}")
-
-
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, search_youtube_keyword))
-application.add_handler(CallbackQueryHandler(handle_youtube_link_button, pattern="^ytlink:"))
