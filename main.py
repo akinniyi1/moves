@@ -1,299 +1,240 @@
+# main.py
 import os
 import re
 import ssl
 import json
+import uuid
+import shutil
 import logging
+import asyncio
 import yt_dlp
 import ffmpeg
-import asyncio
-import asyncpg
-from PIL import Image
+import tempfile
+import psycopg2
 from datetime import datetime, timedelta
-from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+
+from telegram import (
+    Bot, Update, InlineKeyboardButton,
+    InlineKeyboardMarkup, InputMediaDocument
+)
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    filters, CallbackQueryHandler, ContextTypes
 )
 
-ssl._create_default_https_context = ssl._create_unverified_context
-logging.basicConfig(level=logging.INFO)
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL")
-PORT = int(os.getenv("PORT", 10000))
+# === CONFIG ===
+TOKEN = os.environ.get("BOT_TOKEN")
+DB_URL = os.environ.get("DATABASE_URL")
 ADMIN_ID = 1378825382
-DB_URL = os.getenv("DATABASE_URL")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
+PORT = int(os.environ.get("PORT", 8443))
 
-application = Application.builder().token(BOT_TOKEN).build()
-db_pool = None
-file_registry = {}
-image_collections = {}
-pdf_trials = {}
+ssl._create_default_https_context = ssl._create_unverified_context
 
-# ---------- DB HELPERS ----------
+# === DB SETUP ===
+def get_conn():
+    return psycopg2.connect(DB_URL, sslmode="require")
 
-async def get_user(user_id):
-    async with db_pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-        if not user:
-            await conn.execute(
-                "INSERT INTO users (id, name, plan, downloads, expires) VALUES ($1, $2, $3, $4, $5)",
-                user_id, "", "free", json.dumps({}), None
-            )
-            return {"id": user_id, "name": "", "plan": "free", "downloads": {}, "expires": None}
-        downloads = user["downloads"]
-        if isinstance(downloads, str):
-            try:
-                downloads = json.loads(downloads)
-            except:
-                downloads = {}
-        return {
-            "id": user["id"],
-            "name": user["name"],
-            "plan": user["plan"],
-            "downloads": downloads,
-            "expires": user["expires"]
-        }
+def init_db():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT,
+                telegram_id BIGINT UNIQUE,
+                plan TEXT DEFAULT 'free',
+                downloads JSONB DEFAULT '[]',
+                image_trials INT DEFAULT 0,
+                music_trials INT DEFAULT 0,
+                referral_code TEXT,
+                referred_by TEXT,
+                upgrade_expiry TIMESTAMP
+            )""")
+            conn.commit()
 
-async def update_user(user_id, data):
-    async with db_pool.acquire() as conn:
-        user = await get_user(user_id)
-        user.update(data)
-        downloads_json = json.dumps(user["downloads"])
-        await conn.execute(
-            """
-            INSERT INTO users (id, name, plan, downloads, expires)
-            VALUES ($1, $2, $3, $4, $5)
-            ON CONFLICT (id) DO UPDATE SET
-              name = $2, plan = $3, downloads = $4, expires = $5
-            """,
-            user["id"], user["name"], user["plan"], downloads_json, user["expires"]
-        )
+# === USER HELPERS ===
+def get_or_create_user(user):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE telegram_id = %s", (user.id,))
+            if not cur.fetchone():
+                cur.execute("""
+                    INSERT INTO users (username, telegram_id, referral_code)
+                    VALUES (%s, %s, %s)
+                """, (user.username, user.id, str(uuid.uuid4())[:8]))
+                conn.commit()
 
-async def can_download(user_id):
-    user = await get_user(user_id)
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    downloads_today = user["downloads"].get(today, 0)
-    if user["plan"] == "free":
-        return downloads_today < 3
-    else:
-        expiry = user.get("expires")
-        if expiry and expiry < datetime.utcnow().date():
-            await update_user(user_id, {"plan": "free", "expires": None})
-            return downloads_today < 3
-        return True
+def is_upgraded(user_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT upgrade_expiry FROM users WHERE telegram_id = %s", (user_id,))
+            result = cur.fetchone()
+            return result and result[0] and result[0] > datetime.utcnow()
 
-async def log_download(user_id):
-    user = await get_user(user_id)
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    downloads = user["downloads"]
-    downloads[today] = downloads.get(today, 0) + 1
-    await update_user(user_id, {"downloads": downloads})
-
-# ---------- UTILS ----------
-
-def is_valid_url(text):
-    return re.match(r'https?://', text)
-
-def generate_filename(ext="mp4"):
-    return f"video_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
-
-async def delete_file_later(file_path, file_id):
-    await asyncio.sleep(60)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    file_registry.pop(file_id, None)
-
-async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path):
-    audio_path = file_path.replace(".mp4", ".mp3")
-    try:
-        ffmpeg.input(file_path).output(audio_path).run(overwrite_output=True)
-        with open(audio_path, 'rb') as f:
-            await update.callback_query.message.reply_audio(f, filename=os.path.basename(audio_path))
-        os.remove(audio_path)
-    except:
-        await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
-
-# ---------- HANDLERS ----------
-
+# === START & PROFILE ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    await update_user(user.id, {"name": user.username or user.first_name})
-    buttons = [
-        [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
-         InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
-        [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
+    get_or_create_user(user)
+    keyboard = [
+        [InlineKeyboardButton("View Profile", callback_data="profile")],
+        [InlineKeyboardButton("Image to PDF", callback_data="pdf")],
+        [InlineKeyboardButton("Search Music", callback_data="music")],
     ]
     await update.message.reply_text(
-        f"👋 Hello {user.first_name or 'there'}! Send me a video link to download.\n\n"
-        "📌 Free users: 3 downloads/day & max 50MB per video.\n"
-        "Use 'Convert to Audio' within 1 minute before file is auto-deleted.\n\n"
-        "Send multiple images, then use the inline button to generate PDF.",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        f"Welcome {user.username or user.first_name}!\n\n"
+        "Free users: 3 video downloads/day, 1 image-to-PDF trial, 1 music download.\n"
+        "Upgrade to remove limits.",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def view_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    url = update.message.text.strip()
-    if not is_valid_url(url):
-        await update.message.reply_text("❌ That doesn't look like a valid link.")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT plan, upgrade_expiry, referral_code FROM users WHERE telegram_id = %s", (user.id,))
+            plan, expiry, ref_code = cur.fetchone()
+    msg = f"Username: @{user.username}\nPlan: {plan}\nReferral Code: {ref_code}"
+    if expiry:
+        msg += f"\nUpgrade expires: {expiry.strftime('%Y-%m-%d %H:%M:%S')} UTC"
+    await update.callback_query.edit_message_text(msg)
+
+# === IMAGE TO PDF ===
+user_images = {}
+
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    get_or_create_user(update.effective_user)
+    if user_id not in user_images:
+        user_images[user_id] = []
+    file = await update.message.photo[-1].get_file()
+    path = f"{tempfile.gettempdir()}/{uuid.uuid4()}.jpg"
+    await file.download_to_drive(path)
+    user_images[user_id].append(path)
+    await update.message.reply_text("Image received. Click below to convert to PDF:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Convert to PDF", callback_data="convert_pdf")]]))
+
+async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT image_trials FROM users WHERE telegram_id = %s", (user.id,))
+            trials = cur.fetchone()[0]
+            upgraded = is_upgraded(user.id)
+            if trials >= 1 and not upgraded:
+                await update.callback_query.answer("Trial used. Upgrade to unlock more.", show_alert=True)
+                return
+            if not upgraded:
+                cur.execute("UPDATE users SET image_trials = image_trials + 1 WHERE telegram_id = %s", (user.id,))
+                conn.commit()
+    images = user_images.get(user.id, [])
+    if not images:
+        await update.callback_query.answer("No images to convert.")
         return
-    if not await can_download(user.id):
-        await update.message.reply_text("⛔ You've reached your daily limit.")
-        return
-    filename = generate_filename()
-    status_msg = await update.message.reply_text("📥 Downloading video...")
+    from fpdf import FPDF
+    pdf = FPDF()
+    for img in images:
+        pdf.add_page()
+        pdf.image(img, x=10, y=10, w=180)
+    output = f"{tempfile.gettempdir()}/{uuid.uuid4()}.pdf"
+    pdf.output(output)
+    await context.bot.send_document(chat_id=user.id, document=open(output, "rb"))
+    for img in images: os.remove(img)
+    os.remove(output)
+    user_images[user.id] = []
+
+# === YOUTUBE MUSIC SEARCH ===
+async def music_feature(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.edit_message_text("Send the music title or artist name you want to search:")
+
+async def handle_music_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    keyword = update.message.text
+    get_or_create_user(user)
+    upgraded = is_upgraded(user.id)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT music_trials FROM users WHERE telegram_id = %s", (user.id,))
+            trials = cur.fetchone()[0]
+            if trials >= 1 and not upgraded:
+                await update.message.reply_text("Free music download used. Upgrade to continue.")
+                return
+            if not upgraded:
+                cur.execute("UPDATE users SET music_trials = music_trials + 1 WHERE telegram_id = %s", (user.id,))
+                conn.commit()
+
+    filename = f"{uuid.uuid4()}.mp3"
+    filepath = os.path.join(tempfile.gettempdir(), filename)
     ydl_opts = {
-        'outtmpl': filename,
-        'format': 'bestvideo+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'noplaylist': True,
-        'geo_bypass': True,
-        'nocheckcertificate': True,
-        'http_headers': {'User-Agent': 'Mozilla/5.0'},
-        'max_filesize': 50 * 1024 * 1024
+        "format": "bestaudio/best",
+        "outtmpl": filepath,
+        "quiet": True,
+        "noplaylist": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192"
+        }]
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        await log_download(user.id)
-        with open(filename, 'rb') as f:
-            sent = await update.message.reply_video(
-                f,
-                caption="🎉 Here's your video!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")]]),
-            )
-        file_registry[sent.message_id] = filename
-        asyncio.create_task(delete_file_later(filename, sent.message_id))
-        await status_msg.delete()
-    except:
-        await status_msg.edit_text("⚠️ Download failed or file too large.")
+            info = ydl.extract_info(f"ytsearch1:{keyword}", download=True)
+            title = info['entries'][0]['title'] if 'entries' in info else info['title']
+        await update.message.reply_audio(audio=open(filepath, 'rb'), title=title)
+        await asyncio.sleep(60)
+        os.remove(filepath)
+    except Exception as e:
+        await update.message.reply_text("Failed to download music.")
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    image_path = f"image_{datetime.utcnow().strftime('%H%M%S%f')}.jpg"
-    await file.download_to_drive(image_path)
-    if user_id not in image_collections:
-        image_collections[user_id] = []
-    image_collections[user_id].append(image_path)
-    await update.message.reply_text("✅ Image received. Send more or press '🖼️ Convert to PDF'.")
-
-async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, triggered_by_button=False):
-    user_id = update.effective_user.id
-    user = await get_user(user_id)
-
-    if user["plan"] == "free":
-        if pdf_trials.get(user_id, 0) >= 1:
-            await update.message.reply_text("⛔ Free users can only convert 1 PDF. Upgrade for more.")
-            return
-        pdf_trials[user_id] = pdf_trials.get(user_id, 0) + 1
-
-    images = image_collections.get(user_id, [])
-    if not images:
-        await update.message.reply_text("❌ No images received yet. Send images first.")
-        return
-    try:
-        pil_images = [Image.open(img).convert("RGB") for img in images]
-        pdf_path = f"converted_{datetime.utcnow().strftime('%H%M%S')}.pdf"
-        pil_images[0].save(pdf_path, save_all=True, append_images=pil_images[1:])
-        with open(pdf_path, 'rb') as f:
-            await update.message.reply_document(f, filename="converted.pdf")
-        os.remove(pdf_path)
-        for img in images:
-            os.remove(img)
-        image_collections[user_id] = []
-    except Exception:
-        await update.message.reply_text("❌ Failed to generate PDF.")
-
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-    if data == "profile":
-        user = await get_user(user_id)
-        exp = f"\n⏳ Expires: {user['expires']}" if user["expires"] else ""
-        await query.message.reply_text(f"👤 Name: {user['name']}\n💼 Plan: {user['plan']}{exp}")
-    elif data == "total_users" and user_id == ADMIN_ID:
-        async with db_pool.acquire() as conn:
-            total = await conn.fetchval("SELECT COUNT(*) FROM users")
-            await query.message.reply_text(f"👥 Total users: {total}")
-    elif data == "convertpdf_btn":
-        fake_message = type("msg", (), {"message": update.callback_query.message, "effective_user": query.from_user})
-        await convert_pdf(fake_message, context, triggered_by_button=True)
-    elif data.startswith("audio:"):
-        file = data.split("audio:")[1]
-        if not os.path.exists(file):
-            await query.message.reply_text("File deleted. Please resend the link to download again.")
-        else:
-            await convert_to_audio(update, context, file)
-    elif data.startswith("upgrade:"):
-        _, username, days = data.split(":")
-        days = int(days)
-        async with db_pool.acquire() as conn:
-            user = await conn.fetchrow("SELECT * FROM users WHERE name = $1", username)
-            if not user:
-                await query.message.reply_text("❌ User not found.")
-                return
-            expires = datetime.utcnow().date() + timedelta(days=days)
-            await update_user(user["id"], {"plan": "premium", "expires": expires})
-            await query.message.reply_text(f"✅ Upgraded {username} for {days} days.")
-            await application.bot.send_message(user["id"], f"🎉 Your plan was upgraded for {days} days!")
-
-async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# === ADMIN: UPGRADE ===
+async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Not authorized.")
         return
-    if len(context.args) != 1:
+    args = context.args
+    if len(args) != 1:
         await update.message.reply_text("Usage: /upgrade <username>")
         return
-    username = context.args[0]
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("1 Day", callback_data=f"upgrade:{username}:1"),
-                                      InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
-                                      InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
-                                      InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
-    await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
+    username = args[0]
+    keyboard = [[
+        InlineKeyboardButton("1 Day", callback_data=f"ug_{username}_1"),
+        InlineKeyboardButton("7 Days", callback_data=f"ug_{username}_7"),
+        InlineKeyboardButton("30 Days", callback_data=f"ug_{username}_30"),
+    ]]
+    await update.message.reply_text(f"Upgrade @{username} for how long?", reply_markup=InlineKeyboardMarkup(keyboard))
 
-# ---------- WEBHOOK ----------
+async def handle_upgrade_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
+    if not data.startswith("ug_"):
+        return
+    _, username, days = data.split("_")
+    expiry = datetime.utcnow() + timedelta(days=int(days))
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET plan = 'premium', upgrade_expiry = %s WHERE username = %s", (expiry, username))
+            conn.commit()
+    await update.callback_query.edit_message_text(f"@{username} upgraded for {days} days.")
 
-web_app = web.Application()
+# === MAIN ===
+def main():
+    init_db()
+    app = Application.builder().token(TOKEN).build()
 
-async def webhook_handler(request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.update_queue.put(update)
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-    return web.Response(text="ok")
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("upgrade", upgrade))
+    app.add_handler(CallbackQueryHandler(view_profile, pattern="profile"))
+    app.add_handler(CallbackQueryHandler(convert_pdf, pattern="convert_pdf"))
+    app.add_handler(CallbackQueryHandler(music_feature, pattern="music"))
+    app.add_handler(CallbackQueryHandler(handle_upgrade_button, pattern="ug_"))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_music_search))
 
-web_app.router.add_post("/webhook", webhook_handler)
-
-async def on_startup(app):
-    global db_pool
-    db_pool = await asyncpg.create_pool(DB_URL)
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(f"{APP_URL}/webhook")
-    logging.info("✅ Bot started and webhook set.")
-
-async def on_cleanup(app):
-    await application.stop()
-    await application.shutdown()
-    await db_pool.close()
-    logging.info("❌ Bot stopped.")
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=WEBHOOK_URL + f"/{TOKEN}"
+    )
 
 if __name__ == "__main__":
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("upgrade", upgrade_user))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
-    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-    application.add_handler(CallbackQueryHandler(handle_button))
-
-    web_app.on_startup.append(on_startup)
-    web_app.on_cleanup.append(on_cleanup)
-    web.run_app(web_app, port=PORT)
+    main()
