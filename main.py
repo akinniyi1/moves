@@ -126,8 +126,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👥 Total Users", callback_data="total_users")] if user.id == ADMIN_ID else []
     ]
     await update.message.reply_text(
-        f"👋 Hello @{user.username or 'there'}! Send me a video link to download.\n\n"
-        "📌 Free users get:\n• 3 video downloads/day\n• 1 PDF conversion trial\n• Max 50MB video size\n",
+        f"👋 Hello @{user.username or user.first_name}!\n\n"
+        "Send me a video link to download (max 50MB).\n"
+        "📌 Free: 3 video downloads/day, 1 PDF trial.\n",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -135,10 +136,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     url = update.message.text.strip()
     if not is_valid_url(url):
-        await update.message.reply_text("❌ Please send a valid video URL.")
+        await update.message.reply_text("❌ Invalid link.")
         return
     if not await can_download(user.id):
-        await update.message.reply_text("⛔ Daily download limit reached.")
+        await update.message.reply_text("⛔ Daily limit reached.")
         return
     filename = generate_filename()
     status_msg = await update.message.reply_text("📥 Downloading...")
@@ -174,7 +175,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "profile":
         user = await get_user(user_id)
         exp = f"\n⏳ Expires: {user['expires']}" if user["expires"] else ""
-        await query.message.reply_text(f"👤 Username: {user['name']}\n💼 Plan: {user['plan']}{exp}")
+        await query.message.reply_text(f"👤 Name: {user['name']}\n💼 Plan: {user['plan']}{exp}")
     elif data == "total_users" and user_id == ADMIN_ID:
         async with db_pool.acquire() as conn:
             total = await conn.fetchval("SELECT COUNT(*) FROM users")
@@ -232,12 +233,47 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) != 1:
         await update.message.reply_text("Usage: /upgrade <username>")
         return
-    username = context.args[0]
+    username = context.args[0].lstrip("@")
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("1 Day", callback_data=f"upgrade:{username}:1"),
                                       InlineKeyboardButton("5 Days", callback_data=f"upgrade:{username}:5"),
                                       InlineKeyboardButton("10 Days", callback_data=f"upgrade:{username}:10"),
                                       InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
-    await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
+    await update.message.reply_text(f"Select upgrade duration for @{username}:", reply_markup=keyboard)
+
+async def handle_upgrade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    if not data.startswith("upgrade:"):
+        return
+    parts = data.split(":")
+    if len(parts) != 3:
+        return
+    _, username, days = parts
+    try:
+        days = int(days)
+    except:
+        await query.message.reply_text("❌ Invalid duration.")
+        return
+    async with db_pool.acquire() as conn:
+        user_row = await conn.fetchrow("SELECT * FROM users WHERE name = $1", username)
+        if not user_row:
+            await query.message.reply_text(f"❌ No user found with username '{username}'.")
+            return
+        new_expiry = datetime.utcnow().date() + timedelta(days=days)
+        await conn.execute(
+            "UPDATE users SET plan = $1, expires = $2 WHERE name = $3",
+            "premium", new_expiry, username
+        )
+        await query.message.reply_text(f"✅ @{username} upgraded for {days} day(s).")
+        try:
+            await context.bot.send_message(
+                chat_id=user_row["id"],
+                text=f"🎉 You have been upgraded to *premium* for {days} day(s)!",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
 
 # --- [WEBHOOK SETUP] ---
 web_app = web.Application()
@@ -269,13 +305,12 @@ async def on_cleanup(app):
 web_app.on_startup.append(on_startup)
 web_app.on_cleanup.append(on_cleanup)
 
-# --- [HANDLERS] ---
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("upgrade", upgrade_user))
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
 application.add_handler(CallbackQueryHandler(handle_button))
+application.add_handler(CallbackQueryHandler(handle_upgrade_callback, pattern=r'^upgrade:'))
 
-# --- [RUN SERVER] ---
 if __name__ == "__main__":
     web.run_app(web_app, port=PORT)
