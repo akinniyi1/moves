@@ -7,4 +7,3 @@ asyncpg
 pillow
 psycopg2-binary
 python-dotenv
-aiogram==2.25.2
