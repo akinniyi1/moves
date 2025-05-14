@@ -263,7 +263,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
-# --- [WEBHOOK SETUP + HEALTH CHECK] ---
+# --- [WEBHOOK SETUP] ---
 web_app = web.Application()
 
 async def webhook_handler(request):
@@ -275,24 +275,15 @@ async def webhook_handler(request):
         logging.error(f"Webhook error: {e}")
     return web.Response(text="ok")
 
-# Health check route
-async def ping(request):
-    return web.Response(text="pong")
-
 web_app.router.add_post("/webhook", webhook_handler)
-web_app.router.add_get("/ping", ping)
 
 async def on_startup(app):
     global db_pool
-    try:
-        logging.info("Connecting to Railway DB...")
-        db_pool = await asyncpg.create_pool(DB_URL)
-        await application.initialize()
-        await application.start()
-        await application.bot.set_webhook(f"{APP_URL}/webhook")
-        logging.info("✅ Bot is live and webhook set.")
-    except Exception as e:
-        logging.error(f"❌ Failed to start bot or connect to DB: {e}")
+    db_pool = await asyncpg.create_pool(DB_URL)
+    await application.initialize()
+    await application.start()
+    await application.bot.set_webhook(f"{APP_URL}/webhook")
+    logging.info("✅ Webhook set.")
 
 async def on_cleanup(app):
     await application.stop()
