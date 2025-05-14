@@ -49,37 +49,41 @@ async def delete_file_later(path, file_id=None):
 # --- [DATABASE] ---
 async def get_user(user_id):
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-        if row:
-            downloads = json.loads(row["downloads"]) if isinstance(row["downloads"], str) else row["downloads"]
-            return {
-                "id": row["id"],
-                "name": row["name"],
-                "plan": row["plan"],
-                "downloads": downloads,
-                "expires": row["expires"]
-            }
-        else:
-            await conn.execute("""
-                INSERT INTO users (id, name, plan, downloads, expires)
-                VALUES ($1, '', 'free', $2, NULL)
-            """, user_id, json.dumps({}))
+        user = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        if not user:
+            await conn.execute(
+                "INSERT INTO users (id, name, plan, downloads, expires) VALUES ($1, $2, $3, $4, $5)",
+                user_id, "", "free", json.dumps({}), None
+            )
             return {"id": user_id, "name": "", "plan": "free", "downloads": {}, "expires": None}
+        downloads = user["downloads"]
+        if isinstance(downloads, str):
+            try:
+                downloads = json.loads(downloads)
+            except:
+                downloads = {}
+        return {
+            "id": user["id"],
+            "name": user["name"],
+            "plan": user["plan"],
+            "downloads": downloads,
+            "expires": user["expires"]
+        }
 
-async def update_user(user_id, updates):
-    user = await get_user(user_id)
-    user.update(updates)
-    downloads_json = json.dumps(user["downloads"])
+async def update_user(user_id, data):
     async with db_pool.acquire() as conn:
-        await conn.execute("""
+        user = await get_user(user_id)
+        user.update(data)
+        downloads_json = json.dumps(user["downloads"])
+        await conn.execute(
+            """
             INSERT INTO users (id, name, plan, downloads, expires)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (id) DO UPDATE SET
-              name = EXCLUDED.name,
-              plan = EXCLUDED.plan,
-              downloads = EXCLUDED.downloads,
-              expires = EXCLUDED.expires
-        """, user["id"], user["name"], user["plan"], downloads_json, user["expires"])
+              name = $2, plan = $3, downloads = $4, expires = $5
+            """,
+            user["id"], user["name"], user["plan"], downloads_json, user["expires"]
+        )
 
 async def can_download(user_id):
     user = await get_user(user_id)
@@ -88,7 +92,7 @@ async def can_download(user_id):
     if user["plan"] == "free":
         return downloads_today < 3
     else:
-        expiry = user["expires"]
+        expiry = user.get("expires")
         if expiry and expiry < datetime.utcnow().date():
             await update_user(user_id, {"plan": "free", "expires": None})
             return downloads_today < 3
@@ -112,7 +116,7 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
     except:
         await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
 
-# --- [START] ---
+# --- [START HANDLER] ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update_user(user.id, {"name": user.username or user.first_name or ""})
@@ -172,7 +176,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await status_msg.edit_text("⚠️ Download failed or file too large or unsupported.")
 
-# --- [INLINE BUTTONS] ---
+# --- [INLINE BUTTON HANDLER] ---
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -259,7 +263,7 @@ async def upgrade_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                       InlineKeyboardButton("30 Days", callback_data=f"upgrade:{username}:30")]])
     await update.message.reply_text(f"Select upgrade duration for {username}:", reply_markup=keyboard)
 
-# --- [WEBHOOK SETUP] ---
+# --- [WEBHOOK SETUP + HEALTH CHECK] ---
 web_app = web.Application()
 
 async def webhook_handler(request):
@@ -271,15 +275,24 @@ async def webhook_handler(request):
         logging.error(f"Webhook error: {e}")
     return web.Response(text="ok")
 
+# Health check route
+async def ping(request):
+    return web.Response(text="pong")
+
 web_app.router.add_post("/webhook", webhook_handler)
+web_app.router.add_get("/ping", ping)
 
 async def on_startup(app):
     global db_pool
-    db_pool = await asyncpg.create_pool(DB_URL)
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(f"{APP_URL}/webhook")
-    logging.info("✅ Webhook set.")
+    try:
+        logging.info("Connecting to Railway DB...")
+        db_pool = await asyncpg.create_pool(DB_URL)
+        await application.initialize()
+        await application.start()
+        await application.bot.set_webhook(f"{APP_URL}/webhook")
+        logging.info("✅ Bot is live and webhook set.")
+    except Exception as e:
+        logging.error(f"❌ Failed to start bot or connect to DB: {e}")
 
 async def on_cleanup(app):
     await application.stop()
