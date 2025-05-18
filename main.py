@@ -2,10 +2,11 @@
 import os
 import re
 import ssl
-import json
 import logging
 import yt_dlp
 import ffmpeg
+import csv
+import json
 import asyncio
 from PIL import Image
 from datetime import datetime, timedelta
@@ -13,7 +14,8 @@ from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, ConversationHandler, filters
+    CallbackQueryHandler, ContextTypes, filters,
+    ConversationHandler
 )
 
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -23,70 +25,59 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 APP_URL = os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", 10000))
 ADMIN_ID = 1378825382
+DATA_PATH = "/mnt/data/user_data.json"
 
 application = Application.builder().token(BOT_TOKEN).build()
 file_registry = {}
 image_collections = {}
 pdf_trials = {}
+UPGRADE_USERNAME = 1
 
-# --- [USER DATA STORAGE] ---
-USER_DATA_FILE = "/mnt/data/users.json"
-
-def load_user_data():
-    if os.path.exists(USER_DATA_FILE):
-        with open(USER_DATA_FILE, "r") as f:
+# --- [STORAGE UTILS] ---
+def load_users():
+    if os.path.exists(DATA_PATH):
+        with open(DATA_PATH, "r") as f:
             return json.load(f)
     return {}
 
-def save_user_data(data):
-    with open(USER_DATA_FILE, "w") as f:
+def save_users(data):
+    with open(DATA_PATH, "w") as f:
         json.dump(data, f, indent=2)
 
-user_data = load_user_data()
-
 def get_user(username):
-    if not username:
-        return None
-    if username not in user_data:
-        user_data[username] = {"plan": "free", "downloads": 0, "expires_at": ""}
-        save_user_data(user_data)
-    return user_data[username]
+    users = load_users()
+    return users.get(username.lower())
 
-def get_user_plan(username):
-    user = get_user(username)
-    if user["plan"] != "free":
-        expiry = datetime.strptime(user["expires_at"], "%Y-%m-%d %H:%M:%S")
-        if datetime.utcnow() > expiry:
-            user["plan"] = "free"
-            save_user_data(user_data)
-    return user["plan"]
+def set_user(username, key, value):
+    users = load_users()
+    user = users.get(username.lower(), {"plan": "free", "downloads": 0})
+    user[key] = value
+    users[username.lower()] = user
+    save_users(users)
 
 def increment_download(username):
-    user = get_user(username)
-    user["downloads"] += 1
-    save_user_data(user_data)
+    users = load_users()
+    user = users.get(username.lower(), {"plan": "free", "downloads": 0})
+    user["downloads"] = user.get("downloads", 0) + 1
+    users[username.lower()] = user
+    save_users(users)
 
-def has_downloads_left(username):
+def user_is_premium(username):
     user = get_user(username)
-    if user["plan"] == "free" and user["downloads"] >= 3:
+    if not user: return False
+    if user["plan"] != "premium": return False
+    expires = datetime.strptime(user["expires_at"], "%Y-%m-%d %H:%M:%S")
+    if datetime.utcnow() > expires:
+        set_user(username, "plan", "free")
         return False
     return True
 
-def set_user_plan(username, plan, hours):
-    expires_at = datetime.utcnow() + timedelta(hours=hours)
-    user_data[username] = {
-        "plan": plan,
-        "downloads": user_data.get(username, {}).get("downloads", 0),
-        "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S")
-    }
-    save_user_data(user_data)
-
-def plan_days_remaining(username):
-    if username not in user_data or not user_data[username]["expires_at"]:
-        return 0
-    expiry = datetime.strptime(user_data[username]["expires_at"], "%Y-%m-%d %H:%M:%S")
-    delta = expiry - datetime.utcnow()
-    return max(0, delta.days)
+def format_plan(user):
+    if not user or user["plan"] == "free":
+        return "free"
+    expires = datetime.strptime(user["expires_at"], "%Y-%m-%d %H:%M:%S")
+    left = (expires - datetime.utcnow()).total_seconds() / 3600
+    return f"premium ({int(left // 24)} day(s) left)"
 
 # --- [HELPERS] ---
 def is_valid_url(text):
@@ -117,43 +108,52 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username
-    get_user(username)
+    if username:
+        users = load_users()
+        if username.lower() not in users:
+            users[username.lower()] = {"plan": "free", "downloads": 0}
+            save_users(users)
 
     buttons = [
         [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
          InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")]
     ]
     if user.id == ADMIN_ID:
-        buttons.append([InlineKeyboardButton("⏫ Upgrade Plan", callback_data="admin_upgrade")])
+        buttons.append([InlineKeyboardButton("🛠️ Upgrade Plan", callback_data="admin_upgrade")])
 
     await update.message.reply_text(
         f"👋 Hello @{username or user.first_name}!\n\n"
         "This bot supports downloading videos from:\n"
         "✅ Facebook, TikTok, Twitter\n"
         "❌ YouTube & Instagram are not supported.\n\n"
-        "Limit for Free Users:\n"
-        "• 3 video downloads total\n"
-        "• 1 PDF conversion trial\n\n"
-        "Send a supported video link to get started.",
+        "Free Users:\n"
+        "• Max 3 total video downloads\n"
+        "• 1 free PDF conversion\n\n"
+        "Send a video link to get started.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 # --- [VIDEO HANDLER] ---
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    username = user.username
-    if not username:
-        await update.message.reply_text("❌ You must set a Telegram username.")
-        return
-
-    if not has_downloads_left(username):
-        await update.message.reply_text("⛔ You've reached your 3 free downloads. Please upgrade to continue.")
-        return
-
     url = update.message.text.strip()
-    if not is_valid_url(url) or "youtube.com" in url or "youtu.be" in url or "instagram.com" in url:
-        await update.message.reply_text("❌ Invalid or unsupported URL.")
+    if not is_valid_url(url):
+        await update.message.reply_text("❌ Invalid URL or unsupported platform.")
         return
+
+    if "youtube.com" in url or "youtu.be" in url or "instagram.com" in url:
+        await update.message.reply_text("❌ YouTube and Instagram are not supported.")
+        return
+
+    username = update.effective_user.username
+    if not username:
+        await update.message.reply_text("❌ You must set a Telegram @username to use this bot.")
+        return
+
+    if not user_is_premium(username):
+        user = get_user(username)
+        if user["downloads"] >= 3:
+            await update.message.reply_text("⛔ Free users can only download 3 videos. Upgrade to continue.")
+            return
 
     filename = generate_filename()
     status_msg = await update.message.reply_text("📥 Downloading...")
@@ -165,6 +165,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         'noplaylist': True,
         'max_filesize': 50 * 1024 * 1024
     }
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -179,58 +180,35 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_msg.delete()
         increment_download(username)
     except:
-        await status_msg.edit_text("⚠️ Download failed or file too large.")
+        await status_msg.edit_text("⚠️ Download failed or file too large or unsupported.")
 
 # --- [INLINE BUTTON HANDLER] ---
-UPGRADE_USERNAME, = range(1)
-
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    username = query.from_user.username
 
     if data == "profile":
-        plan = get_user_plan(username)
-        days = plan_days_remaining(username)
-        plan_str = f"{plan} (expires in {days} day(s))" if plan != "free" else "free"
-        await query.message.reply_text(f"👤 Username: @{username}\n💼 Plan: {plan_str}")
+        user = update.effective_user
+        udata = get_user(user.username)
+        await query.message.reply_text(f"👤 Username: @{user.username}\n💼 Plan: {format_plan(udata)}")
+
     elif data == "convertpdf_btn":
         fake_msg = type("msg", (), {"message": query.message, "effective_user": query.from_user})
         await convert_pdf(fake_msg, context, triggered_by_button=True)
+
+    elif data == "admin_upgrade" and query.from_user.id == ADMIN_ID:
+        await query.message.reply_text("Send the @username of the user to upgrade:", reply_markup=ReplyKeyboardRemove())
+        return UPGRADE_USERNAME
+
     elif data.startswith("audio:"):
         file = data.split("audio:")[1]
         if not os.path.exists(file):
             await query.message.reply_text("File deleted. Please resend the link.")
         else:
             await convert_to_audio(update, context, file)
-    elif data == "admin_upgrade" and query.from_user.id == ADMIN_ID:
-        await query.message.reply_text("Send the @username of the user to upgrade:", reply_markup=ReplyKeyboardRemove())
-        return UPGRADE_USERNAME
-    return ConversationHandler.END
 
-async def upgrade_receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data["target_username"] = update.message.text.strip().lstrip("@")
-    buttons = [[InlineKeyboardButton("1 Day", callback_data="setplan:1"),
-                InlineKeyboardButton("5 Days", callback_data="setplan:5"),
-                InlineKeyboardButton("30 Days", callback_data="setplan:30")]]
-    await update.message.reply_text("Select plan duration:", reply_markup=InlineKeyboardMarkup(buttons))
-    return ConversationHandler.END
-
-async def handle_upgrade_plan_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.from_user.id != ADMIN_ID:
-        return
-    data = query.data
-    if data.startswith("setplan:"):
-        days = int(data.split(":")[1])
-        target = context.user_data.get("target_username")
-        if target:
-            set_user_plan(target, "premium", days * 24)
-            await query.message.reply_text(f"✅ Upgraded @{target} for {days} day(s).")
-
-# --- [PDF CONVERSION & IMAGE] ---
+# --- [PDF CONVERSION] ---
 async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, triggered_by_button=False):
     user_id = update.effective_user.id
     if pdf_trials.get(user_id, 0) >= 1:
@@ -254,6 +232,7 @@ async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, trigge
     except:
         await update.message.reply_text("❌ Failed to generate PDF.")
 
+# --- [IMAGE HANDLER] ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     photo = update.message.photo[-1]
@@ -265,19 +244,52 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     image_collections[user_id].append(image_path)
     await update.message.reply_text("✅ Image received. Send more or convert to PDF.")
 
-# --- [ADMIN STATS] ---
+# --- [UPGRADE FLOW] ---
+async def upgrade_receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.message.text.strip().lstrip("@")
+    if not username:
+        await update.message.reply_text("Invalid username.")
+        return ConversationHandler.END
+
+    buttons = [
+        [InlineKeyboardButton("1 day", callback_data=f"upgrade:{username}:24"),
+         InlineKeyboardButton("5 days", callback_data=f"upgrade:{username}:120"),
+         InlineKeyboardButton("30 days", callback_data=f"upgrade:{username}:720")]
+    ]
+    await update.message.reply_text(f"Select upgrade duration for @{username}:", reply_markup=InlineKeyboardMarkup(buttons))
+    return ConversationHandler.END
+
+@application.callback_query_handler
+async def inline_upgrade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
+    if data.startswith("upgrade:"):
+        _, username, hours = data.split(":")
+        expires = datetime.utcnow() + timedelta(hours=int(hours))
+        set_user(username, "plan", "premium")
+        set_user(username, "expires_at", expires.strftime("%Y-%m-%d %H:%M:%S"))
+        await update.callback_query.message.reply_text(f"✅ @{username} upgraded for {int(hours)//24} day(s).")
+
+# --- [ADMIN COMMANDS] ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    total = len(user_data)
-    paid = sum(1 for u in user_data.values() if u["plan"] != "free")
-    over_limit = sum(1 for u in user_data.values() if u["downloads"] >= 3 and u["plan"] == "free")
-    await update.message.reply_text(
-        f"📊 Stats:\n"
-        f"• Total users: {total}\n"
-        f"• Paid users: {paid}\n"
-        f"• Free users out of download: {over_limit}"
-    )
+    users = load_users()
+    free = sum(1 for u in users.values() if u["plan"] == "free")
+    paid = sum(1 for u in users.values() if u["plan"] == "premium")
+    await update.message.reply_text(f"📊 Total Users: {len(users)}\n🆓 Free: {free}\n💎 Paid: {paid}")
+
+async def export_csv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    users = load_users()
+    path = "/mnt/data/users_export.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["username", "plan", "downloads", "expires_at"])
+        for uname, data in users.items():
+            writer.writerow([uname, data.get("plan"), data.get("downloads"), data.get("expires_at", "")])
+    with open(path, "rb") as f:
+        await update.message.reply_document(f, filename="users.csv")
 
 # --- [WEBHOOK SETUP] ---
 web_app = web.Application()
@@ -308,15 +320,15 @@ web_app.on_cleanup.append(on_cleanup)
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("stats", stats))
+application.add_handler(CommandHandler("export", export_csv))
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
 application.add_handler(CallbackQueryHandler(handle_button))
-application.add_handler(CallbackQueryHandler(handle_upgrade_plan_button))
-
 application.add_handler(ConversationHandler(
-    entry_points=[CallbackQueryHandler(handle_button)],
+    entry_points=[CallbackQueryHandler(handle_button, pattern="^admin_upgrade$")],
     states={UPGRADE_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, upgrade_receive_username)]},
     fallbacks=[],
+    allow_reentry=True
 ))
 
 if __name__ == "__main__":
