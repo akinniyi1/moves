@@ -161,7 +161,7 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # Main
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).webhook_url(BASE_URL).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("upgrade", upgrade))
@@ -172,7 +172,7 @@ def main():
     app.run_webhook(
         listen="0.0.0.0",
         port=int(os.environ.get("PORT", 10000)),
-        webhook_url=BASE_URL
+        webhook_url=BASE_URL + f"bot{BOT_TOKEN}"
     )
 
 if __name__ == "__main__":
