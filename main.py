@@ -16,7 +16,8 @@ logging.basicConfig(level=logging.INFO)
 
 # Constants
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-BASE_URL = "https://moves-qzsv.onrender.com/"
+RENDER_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")
+BASE_URL = f"https://{RENDER_HOST}/"
 ADMIN_ID = 1378825382
 DATA_PATH = "/mnt/data/users.json"  # Persistent disk path on Render
 
