@@ -10,10 +10,10 @@ import asyncio
 from PIL import Image
 from datetime import datetime, timedelta
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    CallbackQueryHandler, ContextTypes, ConversationHandler, filters
 )
 
 ssl._create_default_https_context = ssl._create_unverified_context
@@ -44,25 +44,45 @@ def save_user_data(data):
 
 user_data = load_user_data()
 
+def get_user(username):
+    if not username:
+        return None
+    if username not in user_data:
+        user_data[username] = {"plan": "free", "downloads": 0, "expires_at": ""}
+        save_user_data(user_data)
+    return user_data[username]
+
 def get_user_plan(username):
-    if not username or username not in user_data:
-        return "free"
-    plan_info = user_data[username]
-    expiry = datetime.strptime(plan_info["expires_at"], "%Y-%m-%d %H:%M:%S")
-    if datetime.utcnow() > expiry:
-        return "free"
-    return plan_info["plan"]
+    user = get_user(username)
+    if user["plan"] != "free":
+        expiry = datetime.strptime(user["expires_at"], "%Y-%m-%d %H:%M:%S")
+        if datetime.utcnow() > expiry:
+            user["plan"] = "free"
+            save_user_data(user_data)
+    return user["plan"]
+
+def increment_download(username):
+    user = get_user(username)
+    user["downloads"] += 1
+    save_user_data(user_data)
+
+def has_downloads_left(username):
+    user = get_user(username)
+    if user["plan"] == "free" and user["downloads"] >= 3:
+        return False
+    return True
 
 def set_user_plan(username, plan, hours):
     expires_at = datetime.utcnow() + timedelta(hours=hours)
     user_data[username] = {
         "plan": plan,
+        "downloads": user_data.get(username, {}).get("downloads", 0),
         "expires_at": expires_at.strftime("%Y-%m-%d %H:%M:%S")
     }
     save_user_data(user_data)
 
 def plan_days_remaining(username):
-    if username not in user_data:
+    if username not in user_data or not user_data[username]["expires_at"]:
         return 0
     expiry = datetime.strptime(user_data[username]["expires_at"], "%Y-%m-%d %H:%M:%S")
     delta = expiry - datetime.utcnow()
@@ -96,18 +116,23 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
 # --- [START HANDLER] ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    username = user.username
+    get_user(username)
+
     buttons = [
         [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
-         InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
-        [InlineKeyboardButton("⏫ Upgrade Plan", callback_data="upgrade_plan")]
+         InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")]
     ]
+    if user.id == ADMIN_ID:
+        buttons.append([InlineKeyboardButton("⏫ Upgrade Plan", callback_data="admin_upgrade")])
+
     await update.message.reply_text(
-        f"👋 Hello @{user.username or user.first_name}!\n\n"
+        f"👋 Hello @{username or user.first_name}!\n\n"
         "This bot supports downloading videos from:\n"
         "✅ Facebook, TikTok, Twitter\n"
         "❌ YouTube & Instagram are not supported.\n\n"
         "Limit for Free Users:\n"
-        "• 3 video downloads per day\n"
+        "• 3 video downloads total\n"
         "• 1 PDF conversion trial\n\n"
         "Send a supported video link to get started.",
         reply_markup=InlineKeyboardMarkup(buttons)
@@ -115,12 +140,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- [VIDEO HANDLER] ---
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
-    if not is_valid_url(url):
-        await update.message.reply_text("❌ Invalid URL or unsupported platform.")
+    user = update.effective_user
+    username = user.username
+    if not username:
+        await update.message.reply_text("❌ You must set a Telegram username.")
         return
-    if "youtube.com" in url or "youtu.be" in url or "instagram.com" in url:
-        await update.message.reply_text("❌ YouTube and Instagram are not supported.")
+
+    if not has_downloads_left(username):
+        await update.message.reply_text("⛔ You've reached your 3 free downloads. Please upgrade to continue.")
+        return
+
+    url = update.message.text.strip()
+    if not is_valid_url(url) or "youtube.com" in url or "youtu.be" in url or "instagram.com" in url:
+        await update.message.reply_text("❌ Invalid or unsupported URL.")
         return
 
     filename = generate_filename()
@@ -145,10 +177,13 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_registry[sent.message_id] = filename
         asyncio.create_task(delete_file_later(filename, sent.message_id))
         await status_msg.delete()
+        increment_download(username)
     except:
-        await status_msg.edit_text("⚠️ Download failed or file too large or unsupported.")
+        await status_msg.edit_text("⚠️ Download failed or file too large.")
 
 # --- [INLINE BUTTON HANDLER] ---
+UPGRADE_USERNAME, = range(1)
+
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -169,22 +204,33 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("File deleted. Please resend the link.")
         else:
             await convert_to_audio(update, context, file)
-    elif data == "upgrade_plan":
-        buttons = [
-            [InlineKeyboardButton("1 Day", callback_data="upgrade:1"),
-             InlineKeyboardButton("5 Days", callback_data="upgrade:5"),
-             InlineKeyboardButton("30 Days", callback_data="upgrade:30")]
-        ]
-        await query.message.reply_text("Choose your upgrade duration:", reply_markup=InlineKeyboardMarkup(buttons))
-    elif data.startswith("upgrade:"):
-        if not username:
-            await query.message.reply_text("❌ You must set a username in Telegram settings.")
-            return
-        days = int(data.split(":")[1])
-        set_user_plan(username, "premium", days * 24)
-        await query.message.reply_text(f"✅ Upgraded to premium for {days} day(s).")
+    elif data == "admin_upgrade" and query.from_user.id == ADMIN_ID:
+        await query.message.reply_text("Send the @username of the user to upgrade:", reply_markup=ReplyKeyboardRemove())
+        return UPGRADE_USERNAME
+    return ConversationHandler.END
 
-# --- [PDF CONVERSION] ---
+async def upgrade_receive_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["target_username"] = update.message.text.strip().lstrip("@")
+    buttons = [[InlineKeyboardButton("1 Day", callback_data="setplan:1"),
+                InlineKeyboardButton("5 Days", callback_data="setplan:5"),
+                InlineKeyboardButton("30 Days", callback_data="setplan:30")]]
+    await update.message.reply_text("Select plan duration:", reply_markup=InlineKeyboardMarkup(buttons))
+    return ConversationHandler.END
+
+async def handle_upgrade_plan_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+    data = query.data
+    if data.startswith("setplan:"):
+        days = int(data.split(":")[1])
+        target = context.user_data.get("target_username")
+        if target:
+            set_user_plan(target, "premium", days * 24)
+            await query.message.reply_text(f"✅ Upgraded @{target} for {days} day(s).")
+
+# --- [PDF CONVERSION & IMAGE] ---
 async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, triggered_by_button=False):
     user_id = update.effective_user.id
     if pdf_trials.get(user_id, 0) >= 1:
@@ -208,7 +254,6 @@ async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, trigge
     except:
         await update.message.reply_text("❌ Failed to generate PDF.")
 
-# --- [IMAGE HANDLER] ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     photo = update.message.photo[-1]
@@ -219,6 +264,20 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_collections[user_id] = []
     image_collections[user_id].append(image_path)
     await update.message.reply_text("✅ Image received. Send more or convert to PDF.")
+
+# --- [ADMIN STATS] ---
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    total = len(user_data)
+    paid = sum(1 for u in user_data.values() if u["plan"] != "free")
+    over_limit = sum(1 for u in user_data.values() if u["downloads"] >= 3 and u["plan"] == "free")
+    await update.message.reply_text(
+        f"📊 Stats:\n"
+        f"• Total users: {total}\n"
+        f"• Paid users: {paid}\n"
+        f"• Free users out of download: {over_limit}"
+    )
 
 # --- [WEBHOOK SETUP] ---
 web_app = web.Application()
@@ -248,9 +307,17 @@ web_app.on_startup.append(on_startup)
 web_app.on_cleanup.append(on_cleanup)
 
 application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("stats", stats))
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
 application.add_handler(CallbackQueryHandler(handle_button))
+application.add_handler(CallbackQueryHandler(handle_upgrade_plan_button))
+
+application.add_handler(ConversationHandler(
+    entry_points=[CallbackQueryHandler(handle_button)],
+    states={UPGRADE_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, upgrade_receive_username)]},
+    fallbacks=[],
+))
 
 if __name__ == "__main__":
     web.run_app(web_app, port=PORT)
