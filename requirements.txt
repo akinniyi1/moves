@@ -5,5 +5,3 @@ ffmpeg-python
 requests
 asyncpg
 pillow
-psycopg2-binary
-python-dotenv
