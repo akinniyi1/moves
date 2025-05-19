@@ -2,12 +2,12 @@
 import os
 import re
 import ssl
-import csv
 import json
 import logging
 import yt_dlp
 import ffmpeg
 import asyncio
+import csv
 from PIL import Image
 from datetime import datetime, timedelta
 from aiohttp import web
@@ -24,14 +24,18 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 APP_URL = os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", 10000))
 ADMIN_ID = 1378825382
-
 DATA_FILE = "/mnt/data/users.json"
+
 application = Application.builder().token(BOT_TOKEN).build()
 file_registry = {}
 image_collections = {}
 pdf_trials = {}
+support_messages = {}
 
-# --- [DATA HANDLING] ---
+# --- [USER STORAGE] ---
+if not os.path.exists("/mnt/data"):
+    os.makedirs("/mnt/data")
+
 def load_users():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
@@ -40,26 +44,9 @@ def load_users():
 
 def save_users(data):
     with open(DATA_FILE, "w") as f:
-        json.dump(data, f)
+        json.dump(data, f, indent=2)
 
 users = load_users()
-
-def get_user(username):
-    if username not in users:
-        users[username] = {"plan": "free", "downloads": 0, "expires": None}
-    return users[username]
-
-def is_premium(user_data):
-    exp = user_data.get("expires")
-    if not exp:
-        return False
-    if datetime.utcnow() > datetime.fromisoformat(exp):
-        user_data["plan"] = "free"
-        user_data["downloads"] = 0
-        user_data["expires"] = None
-        save_users(users)
-        return False
-    return True
 
 # --- [HELPERS] ---
 def is_valid_url(text):
@@ -67,6 +54,11 @@ def is_valid_url(text):
 
 def generate_filename(ext="mp4"):
     return f"file_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
+
+def is_premium(user):
+    if user.get("plan") != "premium": return False
+    if "expires" not in user: return False
+    return datetime.utcnow() < datetime.fromisoformat(user["expires"])
 
 async def delete_file_later(path, file_id=None):
     await asyncio.sleep(60)
@@ -90,34 +82,27 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username
-    if not username:
-        await update.message.reply_text("❌ Username required to use this bot.")
-        return
-
-    get_user(username)
-    save_users(users)
-
+    if username and username not in users:
+        users[username] = {"plan": "free", "downloads": 0}
+        save_users(users)
     buttons = [
         [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
          InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
+        [InlineKeyboardButton("📩 Contact Support", callback_data="support")]
     ]
     await update.message.reply_text(
-        f"👋 Hello @{username}!\n\n"
+        f"👋 Hello @{username or user.first_name}!\n\n"
         "This bot supports downloading videos from:\n"
         "✅ Facebook, TikTok, Twitter, Instagram\n"
         "❌ YouTube is not supported.\n\n"
-        "Limit for Free Users:\n"
-        "• 3 video downloads total\n"
-        "• 1 PDF conversion trial\n\n"
-        "Send a supported video link to get started.",
+        "Free Users:\n• 3 video downloads\n• 1 PDF conversion trial\n\n"
+        "Send a supported video link to begin.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 # --- [VIDEO HANDLER] ---
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
-    user = update.effective_user
-    username = user.username
     if not is_valid_url(url):
         await update.message.reply_text("❌ Invalid URL or unsupported platform.")
         return
@@ -125,7 +110,12 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ YouTube is not supported.")
         return
 
-    user_data = get_user(username)
+    user = update.effective_user
+    username = user.username
+    if not username:
+        await update.message.reply_text("❌ Username is required to use this bot.")
+        return
+    user_data = users.get(username, {"plan": "free", "downloads": 0})
     if not is_premium(user_data) and user_data["downloads"] >= 3:
         await update.message.reply_text("⛔ Free users are limited to 3 downloads. Upgrade to continue.")
         return
@@ -152,34 +142,37 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_registry[sent.message_id] = filename
         asyncio.create_task(delete_file_later(filename, sent.message_id))
         await status_msg.delete()
-
-        user_data["downloads"] += 1
-        save_users(users)
+        if not is_premium(user_data):
+            user_data["downloads"] += 1
+            users[username] = user_data
+            save_users(users)
     except:
-        await status_msg.edit_text("⚠️ Download failed or file too large or unsupported.")
+        await status_msg.edit_text("⚠️ Download failed or file too large.")
 
-# --- [INLINE BUTTON HANDLER] ---
+# --- [INLINE HANDLER] ---
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    username = query.from_user.username
-    user_data = get_user(username)
+    user = query.from_user
+    username = user.username
+    user_data = users.get(username, {"plan": "free"})
 
     if data == "profile":
-        if not is_premium(user_data):
-            user_data["plan"] = "free"
-            user_data["downloads"] = 0
-            user_data["expires"] = None
-        plan = user_data["plan"]
-        exp = user_data["expires"]
-        msg = f"👤 Username: @{username}\n💼 Plan: {plan}"
-        if exp:
-            msg += f"\n⏰ Expires: {exp}"
+        if is_premium(user_data):
+            exp = datetime.fromisoformat(user_data["expires"])
+            users[username]["plan"] = "premium"
+            msg = f"👤 Username: @{username}\n💼 Plan: Premium\n⏰ Expires: {exp.strftime('%Y-%m-%d %H:%M')}"
+        else:
+            users[username]["plan"] = "free"
+            msg = f"👤 Username: @{username}\n💼 Plan: Free"
+        save_users(users)
         await query.message.reply_text(msg)
     elif data == "convertpdf_btn":
         fake_msg = type("msg", (), {"message": query.message, "effective_user": query.from_user})
         await convert_pdf(fake_msg, context, triggered_by_button=True)
+    elif data == "support":
+        await query.message.reply_text("✍️ Send your message. The admin will reply shortly.")
     elif data.startswith("audio:"):
         file = data.split("audio:")[1]
         if not os.path.exists(file):
@@ -187,14 +180,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await convert_to_audio(update, context, file)
 
-# --- [PDF CONVERSION] ---
+# --- [PDF HANDLER] ---
 async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, triggered_by_button=False):
     user_id = update.effective_user.id
     username = update.effective_user.username
-    if pdf_trials.get(user_id, 0) >= 1 and not is_premium(get_user(username)):
-        await update.message.reply_text("⛔ Free users can only convert 1 PDF.")
-        return
-    pdf_trials[user_id] = 1
+    user_data = users.get(username, {"plan": "free"})
+    if not is_premium(user_data):
+        if pdf_trials.get(user_id, 0) >= 1:
+            await update.message.reply_text("⛔ Free users can only convert 1 PDF.")
+            return
+        pdf_trials[user_id] = 1
     images = image_collections.get(user_id, [])
     if not images:
         await update.message.reply_text("❌ No images received.")
@@ -205,7 +200,7 @@ async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, trigge
         pil_images[0].save(pdf_path, save_all=True, append_images=pil_images[1:])
         with open(pdf_path, 'rb') as f:
             await update.message.reply_document(f, filename="converted.pdf")
-        os.remove(pdf_path)
+        asyncio.create_task(delete_file_later(pdf_path))
         for img in images:
             os.remove(img)
         image_collections[user_id] = []
@@ -222,7 +217,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id not in image_collections:
         image_collections[user_id] = []
     image_collections[user_id].append(image_path)
-    asyncio.create_task(delete_file_later(image_path))
     await update.message.reply_text("✅ Image received. Send more or click /convertpdf to generate PDF.")
 
 # --- [ADMIN COMMANDS] ---
@@ -234,6 +228,7 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /upgrade <username> <hours>")
         return
     username, hours = args
+    username = username.lstrip('@')
     if username not in users:
         await update.message.reply_text("❌ User not found.")
         return
@@ -250,12 +245,13 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    if len(context.args) != 1:
+    args = context.args
+    if not args:
         await update.message.reply_text("Usage: /downgrade <username>")
         return
-    username = context.args[0]
+    username = args[0].lstrip('@')
     if username in users:
-        users[username] = {"plan": "free", "downloads": 0, "expires": None}
+        users[username] = {"plan": "free", "downloads": 0}
         save_users(users)
         await update.message.reply_text(f"✅ Downgraded @{username} to free plan.")
 
@@ -275,17 +271,47 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
     await update.message.reply_text(f"✅ Message sent to {count} users.")
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    total = len(users)
+    premium = sum(1 for u in users.values() if u["plan"] == "premium" and is_premium(u))
+    free = total - premium
+    downloads = sum(u.get("downloads", 0) for u in users.values())
+    await update.message.reply_text(
+        f"📊 Stats:\nTotal: {total}\nPremium: {premium}\nFree: {free}\nDownloads: {downloads}"
+    )
+
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    path = "/mnt/data/users.csv"
+    path = "/mnt/data/export.csv"
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Username", "Plan", "Expires"])
-        for uname, info in users.items():
-            writer.writerow([uname, info["plan"], info.get("expires", "")])
+        for uname, data in users.items():
+            exp = data.get("expires", "N/A")
+            writer.writerow([uname, data["plan"], exp])
     with open(path, "rb") as f:
-        await update.message.reply_document(f)
+        await update.message.reply_document(f, filename="users.csv")
+
+# --- [SUPPORT REPLY SYSTEM] ---
+async def support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.reply_to_message and update.effective_user.id == ADMIN_ID:
+        msg_id = update.message.reply_to_message.message_id
+        if msg_id in support_messages:
+            uid = support_messages[msg_id]
+            await context.bot.send_message(chat_id=uid, text=f"📬 Admin reply:\n{update.message.text}")
+
+async def user_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id == ADMIN_ID:
+        return
+    forwarded = await context.bot.send_message(
+        ADMIN_ID,
+        f"📩 Message from @{update.effective_user.username}:\n\n{update.message.text}"
+    )
+    support_messages[forwarded.message_id] = update.effective_user.id
+    await update.message.reply_text("✅ Message sent. You’ll get a reply soon.")
 
 # --- [WEBHOOK SETUP] ---
 web_app = web.Application()
@@ -318,10 +344,14 @@ application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("upgrade", upgrade))
 application.add_handler(CommandHandler("downgrade", downgrade))
 application.add_handler(CommandHandler("broadcast", broadcast))
+application.add_handler(CommandHandler("stats", stats))
 application.add_handler(CommandHandler("export", export))
-application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
+application.add_handler(CommandHandler("convertpdf", lambda u, c: convert_pdf(u, c, False)))
 application.add_handler(CallbackQueryHandler(handle_button))
+application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(r'^https?://'), user_support))
+application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, support_reply))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_video))
 
 if __name__ == "__main__":
     web.run_app(web_app, port=PORT)
