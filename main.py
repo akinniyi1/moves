@@ -32,7 +32,6 @@ image_collections = {}
 pdf_trials = {}
 support_messages = {}
 
-# --- [USER STORAGE] ---
 if not os.path.exists("/mnt/data"):
     os.makedirs("/mnt/data")
 
@@ -56,9 +55,27 @@ def generate_filename(ext="mp4"):
     return f"file_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
 
 def is_premium(user):
-    if user.get("plan") != "premium": return False
-    if "expires" not in user: return False
-    return datetime.utcnow() < datetime.fromisoformat(user["expires"])
+    if user.get("plan") != "premium":
+        return False
+    expires = user.get("expires")
+    if not isinstance(expires, str):
+        return False
+    try:
+        return datetime.utcnow() < datetime.fromisoformat(expires)
+    except:
+        return False
+
+def downgrade_expired_users():
+    now = datetime.utcnow()
+    for username, user in users.items():
+        exp = user.get("expires")
+        if isinstance(exp, str):
+            try:
+                if datetime.fromisoformat(exp) < now:
+                    users[username] = {"plan": "free", "downloads": 0}
+            except:
+                continue
+    save_users(users)
 
 async def delete_file_later(path, file_id=None):
     await asyncio.sleep(60)
@@ -67,22 +84,25 @@ async def delete_file_later(path, file_id=None):
     if file_id:
         file_registry.pop(file_id, None)
 
-def downgrade_expired_users():
-    now = datetime.utcnow()
-    for username, user in users.items():
-        if user.get("plan") == "premium" and "expires" in user:
-            if now >= datetime.fromisoformat(user["expires"]):
-                users[username] = {"plan": "free", "downloads": 0}
-    save_users(users)
+# --- [AUDIO CONVERSION] ---
+async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path):
+    audio_path = file_path.replace(".mp4", ".mp3")
+    try:
+        ffmpeg.input(file_path).output(audio_path).run(overwrite_output=True)
+        with open(audio_path, 'rb') as f:
+            await update.callback_query.message.reply_audio(f, filename=os.path.basename(audio_path))
+        os.remove(audio_path)
+    except:
+        await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
 
 # --- [START HANDLER] ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    downgrade_expired_users()
     user = update.effective_user
     username = user.username
     if username and username not in users:
         users[username] = {"plan": "free", "downloads": 0}
         save_users(users)
-    downgrade_expired_users()
     buttons = [
         [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
          InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
@@ -100,6 +120,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- [VIDEO HANDLER] ---
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    downgrade_expired_users()
     url = update.message.text.strip()
     if not is_valid_url(url):
         await update.message.reply_text("❌ Invalid URL or unsupported platform.")
@@ -107,18 +128,15 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "youtube.com" in url or "youtu.be" in url:
         await update.message.reply_text("❌ YouTube is not supported.")
         return
-
     user = update.effective_user
     username = user.username
     if not username:
         await update.message.reply_text("❌ Username is required to use this bot.")
         return
     user_data = users.get(username, {"plan": "free", "downloads": 0})
-    downgrade_expired_users()
     if not is_premium(user_data) and user_data["downloads"] >= 3:
         await update.message.reply_text("⛔ Free users are limited to 3 downloads. Upgrade to continue.")
         return
-
     filename = generate_filename()
     status_msg = await update.message.reply_text("📥 Downloading...")
     ydl_opts = {
@@ -148,17 +166,6 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await status_msg.edit_text("⚠️ Download failed or file too large.")
 
-# --- [AUDIO CONVERSION] ---
-async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path):
-    audio_path = file_path.replace(".mp4", ".mp3")
-    try:
-        ffmpeg.input(file_path).output(audio_path).run(overwrite_output=True)
-        with open(audio_path, 'rb') as f:
-            await update.callback_query.message.reply_audio(f, filename=os.path.basename(audio_path))
-        os.remove(audio_path)
-    except:
-        await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
-
 # --- [INLINE HANDLER] ---
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -167,12 +174,16 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     username = user.username
     user_data = users.get(username, {"plan": "free"})
-    downgrade_expired_users()
 
     if data == "profile":
+        downgrade_expired_users()
         if is_premium(user_data):
-            exp = datetime.fromisoformat(user_data["expires"])
-            msg = f"👤 Username: @{username}\n💼 Plan: Premium\n⏰ Expires: {exp.strftime('%Y-%m-%d %H:%M')} UTC"
+            exp = user_data.get("expires")
+            try:
+                exp_dt = datetime.fromisoformat(exp)
+                msg = f"👤 Username: @{username}\n💼 Plan: Premium\n⏰ Expires: {exp_dt.strftime('%Y-%m-%d %H:%M')} UTC"
+            except:
+                msg = f"👤 Username: @{username}\n💼 Plan: Premium\n⏰ Expires: Unknown"
         else:
             msg = f"👤 Username: @{username}\n💼 Plan: Free"
         await query.message.reply_text(msg)
@@ -191,7 +202,6 @@ async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, trigge
     user_id = update.effective_user.id
     username = update.effective_user.username
     user_data = users.get(username, {"plan": "free"})
-    downgrade_expired_users()
     if not is_premium(user_data):
         if pdf_trials.get(user_id, 0) >= 1:
             await update.message.reply_text("⛔ Free users can only convert 1 PDF.")
@@ -271,7 +281,7 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     free = total - premium
     downloads = sum(u.get("downloads", 0) for u in users.values())
     await update.message.reply_text(
-        f"📊 Stats:\nTotal Users: {total}\nPremium: {premium}\nFree: {free}\nDownloads: {downloads}"
+        f"📊 Stats:\nTotal Users: {total}\nPremium: {premium}\nFree: {free}\nTotal Downloads: {downloads}"
     )
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -332,7 +342,6 @@ async def on_cleanup(app):
 web_app.on_startup.append(on_startup)
 web_app.on_cleanup.append(on_cleanup)
 
-# --- [HANDLERS] ---
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("upgrade", upgrade))
 application.add_handler(CommandHandler("downgrade", downgrade))
