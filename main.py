@@ -263,5 +263,5 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters
 
 # Admin & support handlers should be added here (upgrade, downgrade, stats, broadcast, support_reply, user_support)
 
-if name == "main":
+if _name_ == "_main_":
     web.run_app(web_app, port=PORT)
