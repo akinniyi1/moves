@@ -1,358 +1,299 @@
 # --- [IMPORTS & SETUP] ---
 import os
-import re
-import ssl
 import json
-import logging
-import yt_dlp
-import ffmpeg
-import asyncio
 import csv
-from PIL import Image
 from datetime import datetime, timedelta
-from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+from uuid import uuid4
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse
+import uvicorn
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Update,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
-
-ssl._create_default_https_context = ssl._create_unverified_context
-logging.basicConfig(level=logging.INFO)
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+import aiohttp
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL")
-PORT = int(os.getenv("PORT", 10000))
-ADMIN_ID = 1378825382
-DATA_FILE = "/mnt/data/users.json"
+ADMIN_ID = 5274852353  # Replace with your Telegram ID
+NOWPAYMENTS_API_KEY = "7HM8ANB-3Q6MHRX-GVYJVFW-ZBGQNKW"
+IPN_SECRET_KEY = "i1xhpaFVbMys4SH+t8jCB4M8AsWRMK7f"
+CHANNEL_LINK = "https://t.me/Downloadassaas"
+WEBHOOK_SECRET = "webhook-secret"
+BASE_URL = "https://moves-qzsv.onrender.com"
 
-application = Application.builder().token(BOT_TOKEN).build()
-file_registry = {}
-image_collections = {}
-pdf_trials = {}
-support_messages = {}
+USERS_FILE = "/mnt/data/users.json"
 
-if not os.path.exists("/mnt/data"):
-    os.makedirs("/mnt/data")
-
+# --- [UTILITY FUNCTIONS] ---
 def load_users():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
+    if os.path.exists(USERS_FILE):
+        with open(USERS_FILE, "r") as f:
             return json.load(f)
     return {}
 
-def save_users(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def save_users(users):
+    with open(USERS_FILE, "w") as f:
+        json.dump(users, f, indent=2)
 
-users = load_users()
+def get_user_data(username):
+    users = load_users()
+    return users.get(username)
 
-# --- [HELPERS] ---
-def is_valid_url(text):
-    return re.match(r'https?://', text)
-
-def generate_filename(ext="mp4"):
-    return f"file_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
-
-def is_premium(user):
-    if user.get("plan") != "premium":
-        return False
-    expires = user.get("expires")
-    if not isinstance(expires, str):
-        return False
-    try:
-        return datetime.utcnow() < datetime.fromisoformat(expires)
-    except:
-        return False
-
-def downgrade_expired_users():
-    now = datetime.utcnow()
-    for username, user in users.items():
-        exp = user.get("expires")
-        if isinstance(exp, str):
-            try:
-                if datetime.fromisoformat(exp) < now:
-                    users[username] = {"plan": "free", "downloads": 0}
-            except:
-                continue
+def update_user(username, data):
+    users = load_users()
+    user = users.get(username, {})
+    user.update(data)
+    users[username] = user
     save_users(users)
 
-async def delete_file_later(path, file_id=None):
-    await asyncio.sleep(60)
-    if os.path.exists(path):
-        os.remove(path)
-    if file_id:
-        file_registry.pop(file_id, None)
+def is_premium(user):
+    expiry = user.get("premium_expiry")
+    if expiry:
+        try:
+            expiry_dt = datetime.fromisoformat(expiry)
+            if datetime.utcnow() < expiry_dt:
+                return True
+        except Exception:
+            return False
+    return False
 
-# --- [AUDIO CONVERSION] ---
-async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, file_path):
-    audio_path = file_path.replace(".mp4", ".mp3")
-    try:
-        ffmpeg.input(file_path).output(audio_path).run(overwrite_output=True)
-        with open(audio_path, 'rb') as f:
-            await update.callback_query.message.reply_audio(f, filename=os.path.basename(audio_path))
-        os.remove(audio_path)
-    except:
-        await update.callback_query.message.reply_text("❌ Failed to convert to audio.")
-
-# --- [START HANDLER] ---
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    downgrade_expired_users()
-    user = update.effective_user
-    username = user.username
-    if username and username not in users:
-        users[username] = {"plan": "free", "downloads": 0}
-        save_users(users)
-    buttons = [
-        [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
-         InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
-        [InlineKeyboardButton("📩 Contact Support", url="https://t.me/DownloadassaasSupport_bot")]
-    ]
-    await update.message.reply_text(
-        f"👋 Hello @{username or user.first_name}!\n\n"
-        "This bot supports downloading videos from:\n"
-        "✅ Facebook, TikTok, Twitter, Instagram\n"
-        "❌ YouTube is not supported.\n\n"
-        "Free Users:\n• 3 video downloads\n• 1 PDF conversion trial\n\n"
-        "Send a supported video link to begin.",
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-# --- [VIDEO HANDLER] ---
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    downgrade_expired_users()
-    url = update.message.text.strip()
-    if not is_valid_url(url):
-        await update.message.reply_text("❌ Invalid URL or unsupported platform.")
-        return
-    if "youtube.com" in url or "youtu.be" in url:
-        await update.message.reply_text("❌ YouTube is not supported.")
-        return
-    user = update.effective_user
-    username = user.username
-    if not username:
-        await update.message.reply_text("❌ Username is required to use this bot.")
-        return
-    user_data = users.get(username, {"plan": "free", "downloads": 0})
-    if not is_premium(user_data) and user_data["downloads"] >= 3:
-        await update.message.reply_text("⛔ Free users are limited to 3 downloads. Upgrade to continue.")
-        return
-    filename = generate_filename()
-    status_msg = await update.message.reply_text("📥 Downloading...")
-    ydl_opts = {
-        'outtmpl': filename,
-        'format': 'bestvideo+bestaudio/best',
-        'merge_output_format': 'mp4',
-        'quiet': True,
-        'noplaylist': True,
-        'max_filesize': 50 * 1024 * 1024
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        with open(filename, 'rb') as f:
-            sent = await update.message.reply_video(
-                f,
-                caption="🎉 Here's your video!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")]])
-            )
-        file_registry[sent.message_id] = filename
-        asyncio.create_task(delete_file_later(filename, sent.message_id))
-        await status_msg.delete()
-        if not is_premium(user_data):
-            user_data["downloads"] += 1
-            users[username] = user_data
-            save_users(users)
-    except:
-        await status_msg.edit_text("⚠️ Download failed or file too large.")
-
-# --- [INLINE HANDLER] ---
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    user = query.from_user
-    username = user.username
-    user_data = users.get(username, {"plan": "free"})
-
-    if data == "profile":
-        downgrade_expired_users()
-        if is_premium(user_data):
-            exp = user_data.get("expires")
+def check_and_downgrade():
+    users = load_users()
+    changed = False
+    for username, user in users.items():
+        expiry = user.get("premium_expiry")
+        if expiry:
             try:
-                exp_dt = datetime.fromisoformat(exp)
-                msg = f"👤 Username: @{username}\n💼 Plan: Premium\n⏰ Expires: {exp_dt.strftime('%Y-%m-%d %H:%M')} UTC"
+                expiry_dt = datetime.fromisoformat(expiry)
+                if datetime.utcnow() >= expiry_dt:
+                    user["premium_expiry"] = None
+                    changed = True
             except:
-                msg = f"👤 Username: @{username}\n💼 Plan: Premium\n⏰ Expires: Unknown"
-        else:
-            msg = f"👤 Username: @{username}\n💼 Plan: Free"
-        await query.message.reply_text(msg)
-    elif data == "convertpdf_btn":
-        fake_msg = type("msg", (), {"message": query.message, "effective_user": query.from_user})
-        await convert_pdf(fake_msg, context, triggered_by_button=True)
-    elif data.startswith("audio:"):
-        file = data.split("audio:")[1]
-        if not os.path.exists(file):
-            await query.message.reply_text("File deleted. Please resend the link.")
-        else:
-            await convert_to_audio(update, context, file)
+                continue
+    if changed:
+        save_users(users)
 
-# --- [PDF HANDLER] ---
-async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, triggered_by_button=False):
-    user_id = update.effective_user.id
+# --- [BOT HANDLERS] ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     username = update.effective_user.username
-    user_data = users.get(username, {"plan": "free"})
-    if not is_premium(user_data):
-        if pdf_trials.get(user_id, 0) >= 1:
-            await update.message.reply_text("⛔ Free users can only convert 1 PDF.")
-            return
-        pdf_trials[user_id] = 1
-    images = image_collections.get(user_id, [])
-    if not images:
-        await update.message.reply_text("❌ No images received.")
+    if not username:
+        await update.message.reply_text("You need a username to use this bot.")
         return
-    try:
-        pil_images = [Image.open(img).convert("RGB") for img in images]
-        pdf_path = generate_filename("pdf")
-        pil_images[0].save(pdf_path, save_all=True, append_images=pil_images[1:])
-        with open(pdf_path, 'rb') as f:
-            await update.message.reply_document(f, filename="converted.pdf")
-        asyncio.create_task(delete_file_later(pdf_path))
-        for img in images:
-            os.remove(img)
-        image_collections[user_id] = []
-    except:
-        await update.message.reply_text("❌ Failed to generate PDF.")
 
-# --- [IMAGE HANDLER] ---
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    photo = update.message.photo[-1]
-    file = await context.bot.get_file(photo.file_id)
-    image_path = f"image_{datetime.utcnow().strftime('%H%M%S%f')}.jpg"
-    await file.download_to_drive(image_path)
-    if user_id not in image_collections:
-        image_collections[user_id] = []
-    image_collections[user_id].append(image_path)
-    await update.message.reply_text("✅ Image received. Send more or click /convertpdf to generate PDF.")
-
-# --- [ADMIN COMMANDS] ---
-async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("Usage: /upgrade <username> <hours>")
-        return
-    username, hours = args
-    username = username.lstrip('@')
+    check_and_downgrade()
+    users = load_users()
     if username not in users:
-        await update.message.reply_text("❌ User not found.")
-        return
-    try:
-        hours = int(hours)
-        expires = datetime.utcnow() + timedelta(hours=hours)
-        users[username]["plan"] = "premium"
-        users[username]["expires"] = expires.isoformat()
+        users[username] = {
+            "downloads": 0,
+            "premium_expiry": None,
+            "banned": False
+        }
         save_users(users)
-        await update.message.reply_text(f"✅ Upgraded @{username} until {expires.strftime('%Y-%m-%d %H:%M')} UTC")
-    except:
-        await update.message.reply_text("❌ Invalid hours")
 
-async def downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if users[username].get("banned"):
+        await update.message.reply_text("You are banned from using this bot.")
         return
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /downgrade <username>")
-        return
-    username = args[0].lstrip('@')
-    if username in users:
-        users[username] = {"plan": "free", "downloads": 0}
-        save_users(users)
-        await update.message.reply_text(f"✅ Downgraded @{username} to free plan.")
 
+    btns = [
+        [KeyboardButton("Profile")],
+        [KeyboardButton("Upgrade Your Plan")],
+        [KeyboardButton("Join Our Channel")]
+    ]
+    markup = ReplyKeyboardMarkup(btns, resize_keyboard=True)
+    await update.message.reply_text("Welcome to the bot!", reply_markup=markup)
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    username = update.effective_user.username
+    if not username:
+        return
+
+    check_and_downgrade()
+    user = get_user_data(username)
+    if not user or user.get("banned"):
+        return
+
+    msg = update.message.text
+    if msg == "Profile":
+        expiry = user.get("premium_expiry")
+        plan = "Premium" if is_premium(user) else "Free"
+        expiry_text = f"\nExpires at: {expiry}" if expiry else ""
+        await update.message.reply_text(f"Your plan: {plan}{expiry_text}")
+    elif msg == "Join Our Channel":
+        await update.message.reply_text("Join our channel:", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Join Channel", url=CHANNEL_LINK)]
+        ]))
+    elif msg == "Upgrade Your Plan":
+        await update.message.reply_text("Choose a plan:", reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("1 month - $2", callback_data="pay_1m")],
+            [InlineKeyboardButton("2 months - $4", callback_data="pay_2m")]
+        ]))
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    username = query.from_user.username
+    await query.answer()
+
+    amount_map = {
+        "pay_1m": (2, 30),
+        "pay_2m": (4, 60)
+    }
+
+    if query.data in amount_map:
+        amount, days = amount_map[query.data]
+        invoice_id = str(uuid4())
+        invoice_data = {
+            "price_amount": amount,
+            "price_currency": "USD",
+            "order_id": invoice_id,
+            "ipn_callback_url": f"{BASE_URL}/ipn",
+            "success_url": "https://t.me/DownloadassaasSupport_bot",
+            "cancel_url": "https://t.me/DownloadassaasSupport_bot"
+        }
+
+        async with aiohttp.ClientSession() as session:
+            headers = {"x-api-key": NOWPAYMENTS_API_KEY}
+            async with session.post("https://api.nowpayments.io/v1/invoice", json=invoice_data, headers=headers) as resp:
+                res = await resp.json()
+                if "invoice_url" in res:
+                    users = load_users()
+                    users[username]["invoice"] = {
+                        "id": invoice_id,
+                        "amount": amount,
+                        "days": days,
+                        "created_at": datetime.utcnow().isoformat()
+                    }
+                    save_users(users)
+                    await query.message.reply_text(f"Pay here: {res['invoice_url']}")
+                else:
+                    await query.message.reply_text("Failed to create invoice. Try again later.")
+
+# --- [COMMANDS] ---
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
-    downgrade_expired_users()
+
+    check_and_downgrade()
+    users = load_users()
     total = len(users)
-    premium = sum(1 for u in users.values() if is_premium(u))
-    free = total - premium
+    paid = sum(1 for u in users.values() if is_premium(u))
+    free = total - paid
     downloads = sum(u.get("downloads", 0) for u in users.values())
-    await update.message.reply_text(
-        f"📊 Stats:\nTotal Users: {total}\nPremium: {premium}\nFree: {free}\nTotal Downloads: {downloads}"
-    )
+    await update.message.reply_text(f"Total: {total}\nFree: {free}\nPaid: {paid}\nDownloads: {downloads}")
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
+
+    users = load_users()
     path = "/mnt/data/export.csv"
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Username", "Plan", "Expires"])
-        for uname, data in users.items():
-            exp = data.get("expires", "N/A")
-            writer.writerow([uname, data["plan"], exp])
-    with open(path, "rb") as f:
-        await update.message.reply_document(f, filename="users.csv")
+        writer.writerow(["Username", "Plan"])
+        for username, user in users.items():
+            plan = "Paid" if is_premium(user) else "Free"
+            writer.writerow([username, plan])
+    await update.message.reply_document(open(path, "rb"))
 
-# --- [SUPPORT SYSTEM] ---
-async def support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.reply_to_message and update.effective_user.id == ADMIN_ID:
-        msg_id = update.message.reply_to_message.message_id
-        if msg_id in support_messages:
-            uid = support_messages[msg_id]
-            await context.bot.send_message(chat_id=uid, text=f"📬 Admin reply:\n{update.message.text}")
-
-async def user_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_ID:
+async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
         return
-    forwarded = await context.bot.send_message(
-        ADMIN_ID,
-        f"📩 Message from @{update.effective_user.username}:\n\n{update.message.text}"
-    )
-    support_messages[forwarded.message_id] = update.effective_user.id
-    await update.message.reply_text("✅ Message sent. You’ll get a reply soon.")
-
-# --- [WEBHOOK SETUP] ---
-web_app = web.Application()
-
-async def webhook_handler(request):
     try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.update_queue.put(update)
-    except Exception as e:
-        logging.error(f"Webhook error: {e}")
-    return web.Response(text="ok")
+        username, duration = context.args[0], int(context.args[1])
+        expiry = datetime.utcnow() + timedelta(hours=duration)
+        update_user(username, {"premium_expiry": expiry.isoformat()})
+        await update.message.reply_text(f"Upgraded {username} for {duration} hours.")
+    except:
+        await update.message.reply_text("Usage: /upgrade username duration_in_hours")
 
-web_app.router.add_post("/webhook", webhook_handler)
+async def downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        username = context.args[0]
+        update_user(username, {"premium_expiry": None})
+        await update.message.reply_text(f"Downgraded {username}.")
+    except:
+        await update.message.reply_text("Usage: /downgrade username")
 
-async def on_startup(app):
-    await application.initialize()
-    await application.start()
-    await application.bot.set_webhook(f"{APP_URL}/webhook")
-    logging.info("✅ Webhook set.")
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        username = context.args[0]
+        update_user(username, {"banned": True})
+        await update.message.reply_text(f"Banned {username}.")
+    except:
+        await update.message.reply_text("Usage: /ban username")
 
-async def on_cleanup(app):
-    await application.stop()
-    await application.shutdown()
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        username = context.args[0]
+        update_user(username, {"banned": False})
+        await update.message.reply_text(f"Unbanned {username}.")
+    except:
+        await update.message.reply_text("Usage: /unban username")
 
-web_app.on_startup.append(on_startup)
-web_app.on_cleanup.append(on_cleanup)
+# --- [FASTAPI ENDPOINT] ---
+app = FastAPI()
 
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("upgrade", upgrade))
-application.add_handler(CommandHandler("downgrade", downgrade))
-application.add_handler(CommandHandler("stats", stats))
-application.add_handler(CommandHandler("export", export))
-application.add_handler(CommandHandler("convertpdf", lambda u, c: convert_pdf(u, c, False)))
-application.add_handler(CallbackQueryHandler(handle_button))
-application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
-application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, support_reply))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(r'^https?://'), user_support))
-application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^https?://'), handle_video))
+@app.post("/ipn")
+async def handle_ipn(request: Request):
+    data = await request.json()
+    order_id = data.get("order_id")
+    payment_status = data.get("payment_status")
+    if payment_status != "finished":
+        return PlainTextResponse("ignored")
+
+    users = load_users()
+    for username, user in users.items():
+        invoice = user.get("invoice")
+        if invoice and invoice["id"] == order_id:
+            created = datetime.fromisoformat(invoice["created_at"])
+            if datetime.utcnow() - created > timedelta(minutes=30):
+                break
+            expiry = datetime.utcnow() + timedelta(days=invoice["days"])
+            user["premium_expiry"] = expiry.isoformat()
+            user.pop("invoice", None)
+            save_users(users)
+            break
+
+    return PlainTextResponse("ok")
+
+# --- [BOT INIT] ---
+app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
+app_bot.add_handler(CommandHandler("start", start))
+app_bot.add_handler(CommandHandler("stats", stats))
+app_bot.add_handler(CommandHandler("export", export))
+app_bot.add_handler(CommandHandler("upgrade", upgrade))
+app_bot.add_handler(CommandHandler("downgrade", downgrade))
+app_bot.add_handler(CommandHandler("ban", ban))
+app_bot.add_handler(CommandHandler("unban", unban))
+app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+app_bot.add_handler(CallbackQueryHandler(callback_handler))
+
+@app.on_event("startup")
+async def startup():
+    await app_bot.initialize()
+    await app_bot.start()
+    await app_bot.updater.start_polling()
+
+@app.on_event("shutdown")
+async def shutdown():
+    await app_bot.updater.stop()
+    await app_bot.stop()
+    await app_bot.shutdown()
 
 if __name__ == "__main__":
-    web.run_app(web_app, port=PORT)
+    uvicorn.run(app, host="0.0.0.0", port=10000)
