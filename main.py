@@ -1,299 +1,285 @@
 # --- [IMPORTS & SETUP] ---
-import os
 import json
 import csv
+import os
+import uuid
 from datetime import datetime, timedelta
-from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse
-import uvicorn
 from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
 )
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ContextTypes, filters
 )
-import aiohttp
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = 5274852353  # Replace with your Telegram ID
-NOWPAYMENTS_API_KEY = "7HM8ANB-3Q6MHRX-GVYJVFW-ZBGQNKW"
-IPN_SECRET_KEY = "i1xhpaFVbMys4SH+t8jCB4M8AsWRMK7f"
-CHANNEL_LINK = "https://t.me/Downloadassaas"
-WEBHOOK_SECRET = "webhook-secret"
-BASE_URL = "https://moves-qzsv.onrender.com"
+# --- [CONFIGURATION] ---
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
+NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET")
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL") + "/webhook"
 
-USERS_FILE = "/mnt/data/users.json"
+DATA_FILE = "/mnt/data/users.json"
+app = FastAPI()
+invoice_timeout_minutes = 30
 
-# --- [UTILITY FUNCTIONS] ---
-def load_users():
-    if os.path.exists(USERS_FILE):
-        with open(USERS_FILE, "r") as f:
+# --- [HELPER FUNCTIONS] ---
+
+def load_data():
+    try:
+        with open(DATA_FILE, "r") as f:
             return json.load(f)
-    return {}
+    except:
+        return {"users": {}, "invoices": {}, "banned": []}
 
-def save_users(users):
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2)
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
-def get_user_data(username):
-    users = load_users()
-    return users.get(username)
+def get_user_data(user_id):
+    data = load_data()
+    return data["users"].get(str(user_id), {})
 
-def update_user(username, data):
-    users = load_users()
-    user = users.get(username, {})
-    user.update(data)
-    users[username] = user
-    save_users(users)
-
-def is_premium(user):
-    expiry = user.get("premium_expiry")
-    if expiry:
-        try:
-            expiry_dt = datetime.fromisoformat(expiry)
-            if datetime.utcnow() < expiry_dt:
-                return True
-        except Exception:
+def is_user_premium(user_data):
+    exp = user_data.get("expires_at")
+    if exp:
+        if datetime.utcnow() > datetime.fromisoformat(exp):
+            user_data["plan"] = "Free"
+            user_data.pop("expires_at", None)
+            save_user_data(user_data["id"], user_data)
             return False
+        return True
     return False
 
-def check_and_downgrade():
-    users = load_users()
-    changed = False
-    for username, user in users.items():
-        expiry = user.get("premium_expiry")
-        if expiry:
-            try:
-                expiry_dt = datetime.fromisoformat(expiry)
-                if datetime.utcnow() >= expiry_dt:
-                    user["premium_expiry"] = None
-                    changed = True
-            except:
-                continue
-    if changed:
-        save_users(users)
+def save_user_data(user_id, user_data):
+    data = load_data()
+    data["users"][str(user_id)] = user_data
+    save_data(data)
 
-# --- [BOT HANDLERS] ---
+def get_total_downloads():
+    data = load_data()
+    return sum(user.get("downloads", 0) for user in data["users"].values())
+
+# --- [TELEGRAM HANDLERS] ---
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.effective_user.username
-    if not username:
-        await update.message.reply_text("You need a username to use this bot.")
-        return
+    user = update.effective_user
+    data = load_data()
 
-    check_and_downgrade()
-    users = load_users()
-    if username not in users:
-        users[username] = {
-            "downloads": 0,
-            "premium_expiry": None,
-            "banned": False
-        }
-        save_users(users)
-
-    if users[username].get("banned"):
+    if user.username in data.get("banned", []):
         await update.message.reply_text("You are banned from using this bot.")
         return
 
-    btns = [
-        [KeyboardButton("Profile")],
+    user_data = data["users"].get(str(user.id))
+    if not user_data:
+        data["users"][str(user.id)] = {
+            "id": user.id,
+            "username": user.username,
+            "plan": "Free",
+            "downloads": 0
+        }
+        save_data(data)
+
+    keyboard = [
+        [KeyboardButton("View Profile")],
         [KeyboardButton("Upgrade Your Plan")],
         [KeyboardButton("Join Our Channel")]
     ]
-    markup = ReplyKeyboardMarkup(btns, resize_keyboard=True)
-    await update.message.reply_text("Welcome to the bot!", reply_markup=markup)
+    await update.message.reply_text(
+        "Welcome to the bot!",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    )
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    username = update.effective_user.username
-    if not username:
-        return
-
-    check_and_downgrade()
-    user = get_user_data(username)
-    if not user or user.get("banned"):
-        return
-
+    user = update.effective_user
     msg = update.message.text
-    if msg == "Profile":
-        expiry = user.get("premium_expiry")
-        plan = "Premium" if is_premium(user) else "Free"
-        expiry_text = f"\nExpires at: {expiry}" if expiry else ""
-        await update.message.reply_text(f"Your plan: {plan}{expiry_text}")
-    elif msg == "Join Our Channel":
-        await update.message.reply_text("Join our channel:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Join Channel", url=CHANNEL_LINK)]
-        ]))
+    data = load_data()
+    user_data = data["users"].get(str(user.id), {})
+
+    if msg == "View Profile":
+        is_premium = is_user_premium(user_data)
+        plan = user_data.get("plan", "Free")
+        expires = user_data.get("expires_at", "N/A")
+        if plan == "Free":
+            expires = "N/A"
+        await update.message.reply_text(
+            f"Username: @{user.username}\nPlan: {plan}\nExpires: {expires}"
+        )
+
     elif msg == "Upgrade Your Plan":
-        await update.message.reply_text("Choose a plan:", reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("1 month - $2", callback_data="pay_1m")],
-            [InlineKeyboardButton("2 months - $4", callback_data="pay_2m")]
-        ]))
+        buttons = [
+            [InlineKeyboardButton("1 Month - $2", callback_data="upgrade_1")],
+            [InlineKeyboardButton("2 Months - $4", callback_data="upgrade_2")]
+        ]
+        await update.message.reply_text("Choose a plan:", reply_markup=InlineKeyboardMarkup(buttons))
 
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    elif msg == "Join Our Channel":
+        await update.message.reply_text("Join our channel: https://t.me/Downloadassaas")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    username = query.from_user.username
     await query.answer()
+    user = query.from_user
+    data = load_data()
 
-    amount_map = {
-        "pay_1m": (2, 30),
-        "pay_2m": (4, 60)
-    }
+    if query.data.startswith("upgrade_"):
+        months = 1 if query.data.endswith("1") else 2
+        amount = 2 * months
+        invoice_id = str(uuid.uuid4())
 
-    if query.data in amount_map:
-        amount, days = amount_map[query.data]
-        invoice_id = str(uuid4())
-        invoice_data = {
-            "price_amount": amount,
-            "price_currency": "USD",
-            "order_id": invoice_id,
-            "ipn_callback_url": f"{BASE_URL}/ipn",
-            "success_url": "https://t.me/DownloadassaasSupport_bot",
-            "cancel_url": "https://t.me/DownloadassaasSupport_bot"
+        data["invoices"][invoice_id] = {
+            "user_id": user.id,
+            "username": user.username,
+            "amount": amount,
+            "months": months,
+            "created_at": datetime.utcnow().isoformat()
         }
+        save_data(data)
 
-        async with aiohttp.ClientSession() as session:
-            headers = {"x-api-key": NOWPAYMENTS_API_KEY}
-            async with session.post("https://api.nowpayments.io/v1/invoice", json=invoice_data, headers=headers) as resp:
-                res = await resp.json()
-                if "invoice_url" in res:
-                    users = load_users()
-                    users[username]["invoice"] = {
-                        "id": invoice_id,
-                        "amount": amount,
-                        "days": days,
-                        "created_at": datetime.utcnow().isoformat()
-                    }
-                    save_users(users)
-                    await query.message.reply_text(f"Pay here: {res['invoice_url']}")
-                else:
-                    await query.message.reply_text("Failed to create invoice. Try again later.")
+        payment_url = f"https://nowpayments.io/payment/?iid={invoice_id}"  # Simulated
+        await query.message.reply_text(
+            f"Pay ${amount} using this link:\n{payment_url}\n\nThis link expires in 30 minutes."
+        )
 
-# --- [COMMANDS] ---
+# --- [COMMANDS FOR ADMIN] ---
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    check_and_downgrade()
-    users = load_users()
-    total = len(users)
-    paid = sum(1 for u in users.values() if is_premium(u))
-    free = total - paid
-    downloads = sum(u.get("downloads", 0) for u in users.values())
-    await update.message.reply_text(f"Total: {total}\nFree: {free}\nPaid: {paid}\nDownloads: {downloads}")
+    data = load_data()
+    users = data["users"].values()
+    total_users = len(set(u["username"] for u in users if u.get("username")))
+    free = sum(1 for u in users if u.get("plan") == "Free")
+    premium = sum(1 for u in users if u.get("plan") == "Premium")
+    downloads = get_total_downloads()
+
+    await update.message.reply_text(
+        f"Total Users: {total_users}\nFree Users: {free}\nPremium Users: {premium}\nTotal Downloads: {downloads}"
+    )
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
 
-    users = load_users()
-    path = "/mnt/data/export.csv"
-    with open(path, "w", newline="") as f:
-        writer = csv.writer(f)
+    data = load_data()
+    filename = "/mnt/data/export.csv"
+    with open(filename, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
         writer.writerow(["Username", "Plan"])
-        for username, user in users.items():
-            plan = "Paid" if is_premium(user) else "Free"
-            writer.writerow([username, plan])
-    await update.message.reply_document(open(path, "rb"))
+        for u in data["users"].values():
+            writer.writerow([u.get("username", "N/A"), u.get("plan", "Free")])
+
+    await update.message.reply_document(document=open(filename, "rb"))
 
 async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID or len(context.args) != 2:
         return
-    try:
-        username, duration = context.args[0], int(context.args[1])
-        expiry = datetime.utcnow() + timedelta(hours=duration)
-        update_user(username, {"premium_expiry": expiry.isoformat()})
-        await update.message.reply_text(f"Upgraded {username} for {duration} hours.")
-    except:
-        await update.message.reply_text("Usage: /upgrade username duration_in_hours")
+
+    username, hours = context.args
+    data = load_data()
+    for user_id, u in data["users"].items():
+        if u.get("username") == username:
+            u["plan"] = "Premium"
+            u["expires_at"] = (datetime.utcnow() + timedelta(hours=int(hours))).isoformat()
+            save_data(data)
+            await update.message.reply_text(f"{username} upgraded for {hours} hour(s).")
+            return
+
+    await update.message.reply_text("User not found.")
 
 async def downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID or len(context.args) != 1:
         return
-    try:
-        username = context.args[0]
-        update_user(username, {"premium_expiry": None})
-        await update.message.reply_text(f"Downgraded {username}.")
-    except:
-        await update.message.reply_text("Usage: /downgrade username")
+
+    username = context.args[0]
+    data = load_data()
+    for user_id, u in data["users"].items():
+        if u.get("username") == username:
+            u["plan"] = "Free"
+            u.pop("expires_at", None)
+            save_data(data)
+            await update.message.reply_text(f"{username} downgraded.")
+            return
+
+    await update.message.reply_text("User not found.")
 
 async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID or len(context.args) != 1:
         return
-    try:
-        username = context.args[0]
-        update_user(username, {"banned": True})
-        await update.message.reply_text(f"Banned {username}.")
-    except:
-        await update.message.reply_text("Usage: /ban username")
+
+    username = context.args[0]
+    data = load_data()
+    if username not in data["banned"]:
+        data["banned"].append(username)
+        save_data(data)
+        await update.message.reply_text(f"{username} banned.")
 
 async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID or len(context.args) != 1:
         return
-    try:
-        username = context.args[0]
-        update_user(username, {"banned": False})
-        await update.message.reply_text(f"Unbanned {username}.")
-    except:
-        await update.message.reply_text("Usage: /unban username")
 
-# --- [FASTAPI ENDPOINT] ---
-app = FastAPI()
+    username = context.args[0]
+    data = load_data()
+    if username in data["banned"]:
+        data["banned"].remove(username)
+        save_data(data)
+        await update.message.reply_text(f"{username} unbanned.")
 
-@app.post("/ipn")
-async def handle_ipn(request: Request):
-    data = await request.json()
-    order_id = data.get("order_id")
-    payment_status = data.get("payment_status")
-    if payment_status != "finished":
-        return PlainTextResponse("ignored")
+# --- [NOWPAYMENTS WEBHOOK HANDLER] ---
 
-    users = load_users()
-    for username, user in users.items():
-        invoice = user.get("invoice")
-        if invoice and invoice["id"] == order_id:
-            created = datetime.fromisoformat(invoice["created_at"])
-            if datetime.utcnow() - created > timedelta(minutes=30):
-                break
-            expiry = datetime.utcnow() + timedelta(days=invoice["days"])
-            user["premium_expiry"] = expiry.isoformat()
-            user.pop("invoice", None)
-            save_users(users)
-            break
+@app.post("/webhook", response_class=PlainTextResponse)
+async def handle_webhook(request: Request):
+    headers = request.headers
+    ipn_secret = headers.get("x-nowpayments-sig")
+    body = await request.json()
 
-    return PlainTextResponse("ok")
+    if ipn_secret != NOWPAYMENTS_IPN_SECRET:
+        return "Invalid signature"
 
-# --- [BOT INIT] ---
-app_bot = ApplicationBuilder().token(BOT_TOKEN).build()
-app_bot.add_handler(CommandHandler("start", start))
-app_bot.add_handler(CommandHandler("stats", stats))
-app_bot.add_handler(CommandHandler("export", export))
-app_bot.add_handler(CommandHandler("upgrade", upgrade))
-app_bot.add_handler(CommandHandler("downgrade", downgrade))
-app_bot.add_handler(CommandHandler("ban", ban))
-app_bot.add_handler(CommandHandler("unban", unban))
-app_bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-app_bot.add_handler(CallbackQueryHandler(callback_handler))
+    invoice_id = body.get("order_id")
+    payment_status = body.get("payment_status")
+    amount_paid = float(body.get("price_amount", 0))
 
-@app.on_event("startup")
-async def startup():
-    await app_bot.initialize()
-    await app_bot.start()
-    await app_bot.updater.start_polling()
+    data = load_data()
+    invoice = data["invoices"].get(invoice_id)
+    if not invoice:
+        return "Invoice not found"
 
-@app.on_event("shutdown")
-async def shutdown():
-    await app_bot.updater.stop()
-    await app_bot.stop()
-    await app_bot.shutdown()
+    created_at = datetime.fromisoformat(invoice["created_at"])
+    if datetime.utcnow() - created_at > timedelta(minutes=invoice_timeout_minutes):
+        return "Invoice expired"
+
+    if payment_status == "confirmed" and abs(amount_paid - invoice["amount"]) < 0.01:
+        user_id = str(invoice["user_id"])
+        user = data["users"].get(user_id)
+        if user:
+            user["plan"] = "Premium"
+            days = 30 * invoice["months"]
+            user["expires_at"] = (datetime.utcnow() + timedelta(days=days)).isoformat()
+            data["users"][user_id] = user
+            save_data(data)
+        return "User upgraded"
+    return "No action"
+
+# --- [MAIN FUNCTION] ---
+
+def main():
+    app_bot = Application.builder().token(TOKEN).build()
+
+    app_bot.add_handler(CommandHandler("start", start))
+    app_bot.add_handler(CommandHandler("stats", stats))
+    app_bot.add_handler(CommandHandler("export", export))
+    app_bot.add_handler(CommandHandler("upgrade", upgrade))
+    app_bot.add_handler(CommandHandler("downgrade", downgrade))
+    app_bot.add_handler(CommandHandler("ban", ban))
+    app_bot.add_handler(CommandHandler("unban", unban))
+    app_bot.add_handler(MessageHandler(filters.TEXT, message_handler))
+    app_bot.add_handler(CallbackQueryHandler(button_handler))
+
+    app_bot.run_polling()
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=10000)
+    main()
