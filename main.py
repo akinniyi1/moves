@@ -24,6 +24,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 APP_URL = os.getenv("RENDER_EXTERNAL_URL")
 PORT = int(os.getenv("PORT", 10000))
 ADMIN_ID = 1378825382
+CHANNEL_URL = "https://t.me/Downloadassaas"
 DATA_FILE = "/mnt/data/users.json"
 
 application = Application.builder().token(BOT_TOKEN).build()
@@ -55,13 +56,22 @@ def generate_filename(ext="mp4"):
     return f"file_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
 
 def is_premium(user):
+    # Immediate UTC-based downgrade on expiry
     if user.get("plan") != "premium":
         return False
-    expires = user.get("expires")
-    if not isinstance(expires, str):
+    exp = user.get("expires")
+    if not isinstance(exp, str):
         return False
     try:
-        return datetime.utcnow() < datetime.fromisoformat(expires)
+        exp_dt = datetime.fromisoformat(exp)
+        if datetime.utcnow() < exp_dt:
+            return True
+        # Expired — downgrade right now
+        user["plan"] = "free"
+        user["downloads"] = 0
+        user.pop("expires", None)
+        save_users(users)
+        return False
     except:
         return False
 
@@ -103,10 +113,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if username and username not in users:
         users[username] = {"plan": "free", "downloads": 0}
         save_users(users)
+    # Ban check
+    if username and users.get(username, {}).get("banned"):
+        await update.message.reply_text("⛔ You are banned from using this bot.")
+        return
+
     buttons = [
         [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
          InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
-        [InlineKeyboardButton("📩 Contact Support", url="https://t.me/DownloadassaasSupport_bot")]
+        [InlineKeyboardButton("📣 Join Our Channel", url=CHANNEL_URL)]
     ]
     await update.message.reply_text(
         f"👋 Hello @{username or user.first_name}!\n\n"
@@ -128,15 +143,19 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if "youtube.com" in url or "youtu.be" in url:
         await update.message.reply_text("❌ YouTube is not supported.")
         return
+
     user = update.effective_user
     username = user.username
-    if not username:
-        await update.message.reply_text("❌ Username is required to use this bot.")
+    # Ban check
+    if username and users.get(username, {}).get("banned"):
+        await update.message.reply_text("⛔ You are banned from using this bot.")
         return
+
     user_data = users.get(username, {"plan": "free", "downloads": 0})
     if not is_premium(user_data) and user_data["downloads"] >= 3:
         await update.message.reply_text("⛔ Free users are limited to 3 downloads. Upgrade to continue.")
         return
+
     filename = generate_filename()
     status_msg = await update.message.reply_text("📥 Downloading...")
     ydl_opts = {
@@ -171,10 +190,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    user = query.from_user
-    username = user.username
-    user_data = users.get(username, {"plan": "free"})
+    username = query.from_user.username
+    # Ban check
+    if username and users.get(username, {}).get("banned"):
+        await query.edit_message_text("⛔ You are banned from using this bot.")
+        return
 
+    user_data = users.get(username, {"plan": "free"})
     if data == "profile":
         downgrade_expired_users()
         if is_premium(user_data):
@@ -201,12 +223,17 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, triggered_by_button=False):
     user_id = update.effective_user.id
     username = update.effective_user.username
+    if username and users.get(username, {}).get("banned"):
+        await update.message.reply_text("⛔ You are banned from using this bot.")
+        return
+
     user_data = users.get(username, {"plan": "free"})
     if not is_premium(user_data):
         if pdf_trials.get(user_id, 0) >= 1:
             await update.message.reply_text("⛔ Free users can only convert 1 PDF.")
             return
         pdf_trials[user_id] = 1
+
     images = image_collections.get(user_id, [])
     if not images:
         await update.message.reply_text("❌ No images received.")
@@ -227,13 +254,16 @@ async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, trigge
 # --- [IMAGE HANDLER] ---
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    username = update.effective_user.username
+    if username and users.get(username, {}).get("banned"):
+        await update.message.reply_text("⛔ You are banned from using this bot.")
+        return
+
     photo = update.message.photo[-1]
     file = await context.bot.get_file(photo.file_id)
     image_path = f"image_{datetime.utcnow().strftime('%H%M%S%f')}.jpg"
     await file.download_to_drive(image_path)
-    if user_id not in image_collections:
-        image_collections[user_id] = []
-    image_collections[user_id].append(image_path)
+    image_collections.setdefault(user_id, []).append(image_path)
     await update.message.reply_text("✅ Image received. Send more or click /convertpdf to generate PDF.")
 
 # --- [ADMIN COMMANDS] ---
@@ -272,12 +302,40 @@ async def downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_users(users)
         await update.message.reply_text(f"✅ Downgraded @{username} to free plan.")
 
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /ban <username>")
+        return
+    username = context.args[0].lstrip('@')
+    if username in users:
+        users[username]["banned"] = True
+        save_users(users)
+        await update.message.reply_text(f"⛔ Banned @{username}")
+    else:
+        await update.message.reply_text("❌ User not found.")
+
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /unban <username>")
+        return
+    username = context.args[0].lstrip('@')
+    if username in users and users[username].get("banned"):
+        users[username]["banned"] = False
+        save_users(users)
+        await update.message.reply_text(f"✅ Unbanned @{username}")
+    else:
+        await update.message.reply_text("❌ User not found or not banned.")
+
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
     downgrade_expired_users()
     total = len(users)
-    premium = sum(1 for u in users.values() if is_premium(u))
+    premium = sum(1 for u in users.values() if u.get("plan") == "premium")
     free = total - premium
     downloads = sum(u.get("downloads", 0) for u in users.values())
     await update.message.reply_text(
@@ -290,10 +348,9 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = "/mnt/data/export.csv"
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Username", "Plan", "Expires"])
+        writer.writerow(["Username", "Plan", "Expires", "Banned"])
         for uname, data in users.items():
-            exp = data.get("expires", "N/A")
-            writer.writerow([uname, data["plan"], exp])
+            writer.writerow([uname, data.get("plan","free"), data.get("expires","N/A"), data.get("banned", False)])
     with open(path, "rb") as f:
         await update.message.reply_document(f, filename="users.csv")
 
@@ -345,6 +402,8 @@ web_app.on_cleanup.append(on_cleanup)
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("upgrade", upgrade))
 application.add_handler(CommandHandler("downgrade", downgrade))
+application.add_handler(CommandHandler("ban", ban))
+application.add_handler(CommandHandler("unban", unban))
 application.add_handler(CommandHandler("stats", stats))
 application.add_handler(CommandHandler("export", export))
 application.add_handler(CommandHandler("convertpdf", lambda u, c: convert_pdf(u, c, False)))
