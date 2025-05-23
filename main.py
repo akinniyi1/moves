@@ -9,7 +9,7 @@ import ffmpeg
 import asyncio
 import csv
 from PIL import Image
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -22,19 +22,19 @@ import uuid
 ssl._create_default_https_context = ssl._create_unverified_context
 logging.basicConfig(level=logging.INFO)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-APP_URL = os.getenv("RENDER_EXTERNAL_URL")
-PORT = int(os.getenv("PORT", 10000))
-ADMIN_ID = 1378825382
-CHANNEL_URL = "https://t.me/Downloadassaas"
-DATA_FILE = "/mnt/data/users.json"
-NOW_API_KEY = os.getenv("NOWPAYMENTS_API_KEY")
+BOT_TOKEN      = os.getenv("BOT_TOKEN")
+APP_URL        = os.getenv("RENDER_EXTERNAL_URL")
+PORT           = int(os.getenv("PORT", 10000))
+ADMIN_ID       = 1378825382
+CHANNEL_URL    = "https://t.me/Downloadassaas"
+DATA_FILE      = "/mnt/data/users.json"
+NOW_API_KEY    = os.getenv("NOWPAYMENTS_API_KEY")
 NOW_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET")
 
-application = Application.builder().token(BOT_TOKEN).build()
-file_registry = {}
+application      = Application.builder().token(BOT_TOKEN).build()
+file_registry    = {}
 image_collections = {}
-pdf_trials = {}
+pdf_trials       = {}
 support_messages = {}
 pending_invoices = {}  # invoice_id -> (username, amount)
 
@@ -64,16 +64,17 @@ def generate_filename(ext="mp4"):
     return f"file_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.{ext}"
 
 def is_premium(user):
+    # Only “premium” plan with a valid UTC expiry is premium
     if user.get("plan") != "premium":
         return False
     exp = user.get("expires")
     if not isinstance(exp, str):
         return False
     try:
-        exp_dt = datetime.fromisoformat(exp)
-        if datetime.now(timezone.utc) < exp_dt:
+        exp_dt = datetime.fromisoformat(exp)       # naive UTC datetime
+        if datetime.utcnow() < exp_dt:             # compare naive UTC
             return True
-        # expired → immediate downgrade
+        # Expired → immediate downgrade
         user["plan"] = "free"
         user["downloads"] = 0
         user.pop("expires", None)
@@ -83,7 +84,7 @@ def is_premium(user):
     return False
 
 def downgrade_expired_users():
-    now = datetime.now(timezone.utc)
+    now = datetime.utcnow()
     for username, user in users.items():
         exp = user.get("expires")
         if isinstance(exp, str):
@@ -133,7 +134,6 @@ async def cancel_invoice_later(inv_id):
 
 async def ipn_handler(request):
     data = await request.json()
-    # verify secret
     if data.get("ipn_secret") != NOW_IPN_SECRET:
         return web.Response(text="invalid secret", status=400)
     if data.get("payment_status") == "finished":
@@ -142,14 +142,10 @@ async def ipn_handler(request):
         if tup:
             username, amount = tup
         else:
-            # fallback parse
-            order = data.get("order_id","").split(":")
-            if len(order) >= 2:
-                username, amount = order[0], float(order[1])
-            else:
-                return web.Response(text="bad order_id", status=400)
+            parts = data.get("order_id","").split(":")
+            username, amount = parts[0], float(parts[1])
         days = 30 if amount == 2.0 else 60
-        exp = datetime.now(timezone.utc) + timedelta(days=days)
+        exp = datetime.utcnow() + timedelta(days=days)
         users[username]["plan"] = "premium"
         users[username]["expires"] = exp.isoformat()
         save_users(users)
@@ -234,7 +230,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent = await update.message.reply_video(
                 f,
                 caption="🎉 Here's your video!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")]])
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")]
+                ])
             )
         file_registry[sent.message_id] = filename
         asyncio.create_task(delete_file_later(filename, sent.message_id))
@@ -269,7 +267,6 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         invoice = await create_invoice(username, amount)
         return await query.message.reply_text(f"Please pay ${amount} here:\n{invoice.get('invoice_url')}")
 
-    # existing profile / convertpdf_btn / audio: branches unchanged
     if data == "profile":
         downgrade_expired_users()
         user_data = users.get(username, {"plan": "free"})
@@ -279,9 +276,11 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             msg = f"👤 Username: @{username}\n💼 Plan: Free"
         await query.message.reply_text(msg)
+
     elif data == "convertpdf_btn":
         fake_msg = type("msg", (), {"message": query.message, "effective_user": query.from_user})
         await convert_pdf(fake_msg, context, triggered_by_button=True)
+
     elif data.startswith("audio:"):
         file = data.split("audio:")[1]
         if not os.path.exists(file):
@@ -352,7 +351,9 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users[username]["plan"] = "premium"
         users[username]["expires"] = expires.isoformat()
         save_users(users)
-        return await update.message.reply_text(f"✅ Upgraded @{username} until {expires.strftime('%Y-%m-%d %H:%M')} UTC")
+        return await update.message.reply_text(
+            f"✅ Upgraded @{username} until {expires.strftime('%Y-%m-%d %H:%M')} UTC"
+        )
     except:
         return await update.message.reply_text("❌ Invalid hours")
 
@@ -401,7 +402,11 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     free = total - premium
     downloads = sum(u.get("downloads", 0) for u in users.values())
     await update.message.reply_text(
-        f"📊 Stats:\nTotal Users: {total}\nPremium: {premium}\nFree: {free}\nTotal Downloads: {downloads}"
+        f"📊 Stats:\n"
+        f"Total Users: {total}\n"
+        f"Premium: {premium}\n"
+        f"Free: {free}\n"
+        f"Total Downloads: {downloads}"
     )
 
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -412,7 +417,12 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         writer = csv.writer(f)
         writer.writerow(["Username", "Plan", "Expires", "Banned"])
         for uname, data in users.items():
-            writer.writerow([uname, data.get("plan","free"), data.get("expires","N/A"), data.get("banned", False)])
+            writer.writerow([
+                uname,
+                data.get("plan", "free"),
+                data.get("expires", "N/A"),
+                data.get("banned", False)
+            ])
     with open(path, "rb") as f:
         await update.message.reply_document(f, filename="users.csv")
 
@@ -423,7 +433,10 @@ async def support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_id = update.message.reply_to_message.message_id
         if msg_id in support_messages:
             uid = support_messages[msg_id]
-            await context.bot.send_message(chat_id=uid, text=f"📬 Admin reply:\n{update.message.text}")
+            await context.bot.send_message(
+                chat_id=uid,
+                text=f"📬 Admin reply:\n{update.message.text}"
+            )
 
 async def user_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
@@ -450,7 +463,6 @@ async def webhook_handler(request):
 
 web_app.router.add_post("/webhook", webhook_handler)
 web_app.router.add_post("/ipn", ipn_handler)
-
 
 async def on_startup(app):
     await application.initialize()
