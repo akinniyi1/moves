@@ -19,6 +19,9 @@ from telegram.ext import (
 import aiohttp
 import uuid
 
+# === NEW: import fpdf for Text-to-PDF ===
+from fpdf import FPDF
+
 ssl._create_default_https_context = ssl._create_unverified_context
 logging.basicConfig(level=logging.INFO)
 
@@ -37,6 +40,9 @@ image_collections = {}
 pdf_trials       = {}
 support_messages = {}
 pending_invoices = {}  # invoice_id -> (username, amount)
+
+# === NEW: Broadcast state stored in memory per admin ===
+#    We'll use context.user_data to track "awaiting_broadcast" for admin.
 
 if not os.path.exists("/mnt/data"):
     os.makedirs("/mnt/data")
@@ -142,7 +148,7 @@ async def ipn_handler(request):
         if tup:
             username, amount = tup
         else:
-            parts = data.get("order_id","").split(":")
+            parts = data.get("order_id", "").split(":")
             username, amount = parts[0], float(parts[1])
         days = 30 if amount == 2.0 else 60
         exp = datetime.utcnow() + timedelta(days=days)
@@ -170,8 +176,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     username = user.username
     if username and username not in users:
-        users[username] = {"plan": "free", "downloads": 0}
+        # Initialize new user with trial flags
+        users[username] = {
+            "plan": "free",
+            "downloads": 0,
+            "banned": False,
+            "text_pdf_trial": False,
+            "video_gif_trial": False
+        }
         save_users(users)
+
+    # Ban check
     if username and users.get(username, {}).get("banned"):
         return await update.message.reply_text("⛔ You are banned from using this bot.")
 
@@ -179,15 +194,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("👤 View Profile", callback_data="profile"),
          InlineKeyboardButton("🖼️ Convert to PDF", callback_data="convertpdf_btn")],
         [InlineKeyboardButton("💳 Upgrade Your Plan", callback_data="upgrade_plan")],
+        [InlineKeyboardButton("✉️ Text to PDF", callback_data="text_pdf")],
         [InlineKeyboardButton("📣 Join Our Channel", url=CHANNEL_URL)]
     ]
+
+    # === NEW: Admin-only Broadcast Button ===
+    if user.id == ADMIN_ID:
+        buttons.append([InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")])
+
     await update.message.reply_text(
         f"👋 Hello @{username or user.first_name}!\n\n"
         "This bot supports downloading videos from:\n"
         "✅ Facebook, TikTok, Twitter, Instagram\n"
         "❌ YouTube is not supported.\n\n"
-        "Free Users:\n• 3 video downloads\n• 1 PDF conversion trial\n\n"
-        "Send a supported video link to begin.",
+        "Free Users:\n• 3 video downloads\n• 1 PDF conversion trial\n• 1 Text-to-PDF trial\n• 1 Video-to-GIF trial\n\n"
+        "Send a supported video link to begin or use the menu below.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
 
@@ -205,6 +226,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     user = update.effective_user
     username = user.username
+    # Ban check
     if username and users.get(username, {}).get("banned"):
         return await update.message.reply_text("⛔ You are banned from using this bot.")
 
@@ -231,7 +253,10 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f,
                 caption="🎉 Here's your video!",
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}")]
+                    [
+                        InlineKeyboardButton("🎧 Convert to Audio", callback_data=f"audio:{filename}"),
+                        InlineKeyboardButton("🎞️ Convert to GIF", callback_data=f"gif:{filename}")
+                    ]
                 ])
             )
         file_registry[sent.message_id] = filename
@@ -250,11 +275,33 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     username = query.from_user.username
+
+    # Ban check
     if username and users.get(username, {}).get("banned"):
         return await query.edit_message_text("⛔ You are banned from using this bot.")
 
     data = query.data
 
+    # === NEW: Handle Text-to-PDF button callback ===
+    if data == "text_pdf":
+        await query.message.reply_text(
+            "📄 Send me the text you want converted to PDF.\n"
+            "(You have 1 free trial; premium users have no limit.)"
+        )
+        # Mark that next text from this user is for conversion
+        context.user_data["awaiting_text_pdf"] = True
+        return
+
+    # === NEW: Handle Admin Broadcast button callback ===
+    if data == "admin_broadcast":
+        if query.from_user.id == ADMIN_ID:
+            await query.message.reply_text("📣 Please type the broadcast message to send to all users.")
+            context.user_data["awaiting_broadcast"] = True
+        else:
+            await query.answer("⛔ You are not authorized.", show_alert=True)
+        return
+
+    # === Existing upgrade / invoice logic ===
     if data == "upgrade_plan":
         opts = [
             [InlineKeyboardButton("$2 - 1 month", callback_data="invoice_2")],
@@ -276,20 +323,56 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             msg = f"👤 Username: @{username}\n💼 Plan: Free"
         await query.message.reply_text(msg)
+        return
 
-    elif data == "convertpdf_btn":
+    if data == "convertpdf_btn":
         fake_msg = type("msg", (), {"message": query.message, "effective_user": query.from_user})
         await convert_pdf(fake_msg, context, triggered_by_button=True)
+        return
 
-    elif data.startswith("audio:"):
+    if data.startswith("audio:"):
         file = data.split("audio:")[1]
         if not os.path.exists(file):
-            await query.message.reply_text("File deleted. Please resend the link.")
+            await query.message.reply_text("❌ File deleted. Please resend the link.")
         else:
             await convert_to_audio(update, context, file)
+        return
+
+    # === NEW: Handle GIF conversion callback ===
+    if data.startswith("gif:"):
+        video_path = data.split("gif:")[1]
+        # Pass to the video-to-GIF handler
+        fake_msg = type("msg", (), {"message": query.message, "effective_user": query.from_user, "video": type("v", (), {"file_id": None})})
+        # We’ll embed conversion logic directly here instead of separate function
+        user_id = query.from_user.id
+        username = query.from_user.username
+        user = users.get(username, {"plan": "free", "video_gif_trial": False})
+        if not is_premium(user) and user.get("video_gif_trial"):
+            return await query.message.reply_text("⛔ Free trial used. Upgrade to use again.")
+        # Mark trial if not premium
+        if not is_premium(user):
+            users[username]["video_gif_trial"] = True
+            save_users(users)
+
+        # Convert the video file at video_path to GIF
+        try:
+            input_path = video_path
+            output_path = f"/mnt/data/{username}_converted.gif"
+            # Limit to first 10 seconds
+            clip = ffmpeg.input(input_path, ss=0, t=10)
+            clip = clip.filter('fps', fps=10, scale='320:-1:flags=lanczos')  # optional sizing
+            clip = ffmpeg.output(clip, output_path)
+            clip.run(overwrite_output=True)
+            await query.message.reply_document(document=open(output_path, "rb"), filename="converted.gif")
+            os.remove(output_path)
+        except Exception:
+            await query.message.reply_text("❌ Failed to convert video to GIF.")
+        return
+
+    # Fall-back: do nothing for unrecognized callback_data
 
 
-# --- [PDF HANDLER] ---
+# --- [PDF FROM IMAGES HANDLER] ---
 async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, triggered_by_button=False):
     user_id = update.effective_user.id
     username = update.effective_user.username
@@ -351,9 +434,7 @@ async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         users[username]["plan"] = "premium"
         users[username]["expires"] = expires.isoformat()
         save_users(users)
-        return await update.message.reply_text(
-            f"✅ Upgraded @{username} until {expires.strftime('%Y-%m-%d %H:%M')} UTC"
-        )
+        return await update.message.reply_text(f"✅ Upgraded @{username} until {expires.strftime('%Y-%m-%d %H:%M')} UTC")
     except:
         return await update.message.reply_text("❌ Invalid hours")
 
@@ -365,7 +446,9 @@ async def downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await update.message.reply_text("Usage: /downgrade <username>")
     username = args[0].lstrip('@')
     if username in users:
-        users[username] = {"plan": "free", "downloads": 0}
+        users[username] = {"plan": "free", "downloads": 0, "banned": users[username].get("banned", False),
+                           "text_pdf_trial": users[username].get("text_pdf_trial", False),
+                           "video_gif_trial": users[username].get("video_gif_trial", False)}
         save_users(users)
         return await update.message.reply_text(f"✅ Downgraded @{username} to free plan.")
 
@@ -415,13 +498,15 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = "/mnt/data/export.csv"
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Username", "Plan", "Expires", "Banned"])
+        writer.writerow(["Username", "Plan", "Expires", "Banned", "TextPDF_Used", "VideoGIF_Used"])
         for uname, data in users.items():
             writer.writerow([
                 uname,
                 data.get("plan", "free"),
                 data.get("expires", "N/A"),
-                data.get("banned", False)
+                data.get("banned", False),
+                data.get("text_pdf_trial", False),
+                data.get("video_gif_trial", False)
             ])
     with open(path, "rb") as f:
         await update.message.reply_document(f, filename="users.csv")
@@ -433,12 +518,213 @@ async def support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_id = update.message.reply_to_message.message_id
         if msg_id in support_messages:
             uid = support_messages[msg_id]
-            await context.bot.send_message(
-                chat_id=uid,
-                text=f"📬 Admin reply:\n{update.message.text}"
-            )
+            await context.bot.send_message(chat_id=uid, text=f"📬 Admin reply:\n{update.message.text}")
 
 async def user_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id == ADMIN_ID:
+        return
+    forwarded = await context.bot.send_message(
+        ADMIN_ID,
+        f"📩 Message from @{update.effective_user.username}:\n\n{update.message.text}"
+    )
+    support_messages[forwarded.message_id] = update.effective_user.id
+    await update.message.reply_text("✅ Message sent. You’ll get a reply soon.")
+
+
+# --- [TEXT MESSAGE HANDLER] ---
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles:
+      - user_support (non-command, non-URL text)
+      - text-to-PDF when context.user_data["awaiting_text_pdf"] is True
+      - admin broadcast when context.user_data["awaiting_broadcast"] is True
+    """
+    # First, check if admin is awaiting broadcast
+    if context.user_data.get("awaiting_broadcast"):
+        # Only ADMIN_ID can be here, but double-check
+        if update.effective_user.id == ADMIN_ID:
+            context.user_data["awaiting_broadcast"] = False
+            message_text = update.message.text
+            count = 0
+            for uname, data in users.items():
+                if data.get("banned"):
+                    continue
+                try:
+                    await context.bot.send_message(chat_id=f"@{uname}", text=message_text)
+                    count += 1
+                    await asyncio.sleep(0.05)  # throttle
+                except:
+                    continue
+            return await update.message.reply_text(f"✅ Broadcast sent to {count} users.")
+        else:
+            return await update.message.reply_text("⛔ You are not authorized to broadcast.")
+
+    # Next, check if user is awaiting text-to-PDF
+    if context.user_data.get("awaiting_text_pdf"):
+        context.user_data["awaiting_text_pdf"] = False
+        user_id = str(update.effective_user.id)
+        username = update.effective_user.username or "NoUsername"
+
+        # Reload users in case changed
+        all_users = load_users()
+
+        # Initialize if missing
+        if username not in all_users:
+            all_users[username] = {
+                "plan": "free",
+                "downloads": 0,
+                "banned": False,
+                "text_pdf_trial": False,
+                "video_gif_trial": False
+            }
+
+        user = all_users[username]
+        # Check trial or premium
+        if not user.get("premium") and user.get("text_pdf_trial"):
+            return await update.message.reply_text("⛔ Free trial used. Upgrade your plan to use again.")
+
+        # Mark trial used if not premium
+        if not user.get("premium"):
+            all_users[username]["text_pdf_trial"] = True
+            save_users(all_users)
+
+        text = update.message.text
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_auto_page_break(auto=True, margin=15)
+        pdf.set_font("Arial", size=12)
+        for line in text.splitlines():
+            pdf.multi_cell(0, 10, line)
+        file_path = f"/mnt/data/{username}_text.pdf"
+        pdf.output(file_path)
+        await update.message.reply_document(document=open(file_path, "rb"), filename="converted_text.pdf")
+        return
+
+    # Fallback: Support messages from regular users
+    if update.effective_user.id != ADMIN_ID and not update.message.text.startswith("/"):
+        forwarded = await context.bot.send_message(
+            ADMIN_ID,
+            f"📩 Message from @{update.effective_user.username}:\n\n{update.message.text}"
+        )
+        support_messages[forwarded.message_id] = update.effective_user.id
+        return await update.message.reply_text("✅ Message sent. You’ll get a reply soon.")
+
+
+# --- [VIDEO TO GIF HELPER] ---
+# (Already handled inline in handle_button under `gif:` callback_data)
+
+
+# --- [COMMAND HANDLERS] ---
+async def upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # unchanged from original
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if len(args) != 2:
+        return await update.message.reply_text("Usage: /upgrade <username> <hours>")
+    username, hours = args
+    username = username.lstrip('@')
+    if username not in users:
+        return await update.message.reply_text("❌ User not found.")
+    try:
+        hours = int(hours)
+        expires = datetime.utcnow() + timedelta(hours=hours)
+        users[username]["plan"] = "premium"
+        users[username]["expires"] = expires.isoformat()
+        save_users(users)
+        return await update.message.reply_text(f"✅ Upgraded @{username} until {expires.strftime('%Y-%m-%d %H:%M')} UTC")
+    except:
+        return await update.message.reply_text("❌ Invalid hours")
+
+async def downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # unchanged from original
+    if update.effective_user.id != ADMIN_ID:
+        return
+    args = context.args
+    if not args:
+        return await update.message.reply_text("Usage: /downgrade <username>")
+    username = args[0].lstrip('@')
+    if username in users:
+        users[username] = {"plan": "free", "downloads": 0, "banned": users[username].get("banned", False),
+                           "text_pdf_trial": users[username].get("text_pdf_trial", False),
+                           "video_gif_trial": users[username].get("video_gif_trial", False)}
+        save_users(users)
+        return await update.message.reply_text(f"✅ Downgraded @{username} to free plan.")
+
+async def ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # unchanged from original
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if len(context.args) != 1:
+        return await update.message.reply_text("Usage: /ban <username>")
+    username = context.args[0].lstrip('@')
+    if username in users:
+        users[username]["banned"] = True
+        save_users(users)
+        return await update.message.reply_text(f"⛔ Banned @{username}")
+    return await update.message.reply_text("❌ User not found.")
+
+async def unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # unchanged from original
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if len(context.args) != 1:
+        return await update.message.reply_text("Usage: /unban <username>")
+    username = context.args[0].lstrip('@')
+    if username in users and users[username].get("banned"):
+        users[username]["banned"] = False
+        save_users(users)
+        return await update.message.reply_text(f"✅ Unbanned @{username}")
+    return await update.message.reply_text("❌ User not found or not banned.")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # unchanged from original
+    if update.effective_user.id != ADMIN_ID:
+        return
+    downgrade_expired_users()
+    total = len(users)
+    premium = sum(1 for u in users.values() if u.get("plan") == "premium")
+    free = total - premium
+    downloads = sum(u.get("downloads", 0) for u in users.values())
+    await update.message.reply_text(
+        f"📊 Stats:\n"
+        f"Total Users: {total}\n"
+        f"Premium: {premium}\n"
+        f"Free: {free}\n"
+        f"Total Downloads: {downloads}"
+    )
+
+async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # unchanged from original except CSV now includes trials
+    if update.effective_user.id != ADMIN_ID:
+        return
+    path = "/mnt/data/export.csv"
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Username", "Plan", "Expires", "Banned", "TextPDF_Used", "VideoGIF_Used"])
+        for uname, data in users.items():
+            writer.writerow([
+                uname,
+                data.get("plan", "free"),
+                data.get("expires", "N/A"),
+                data.get("banned", False),
+                data.get("text_pdf_trial", False),
+                data.get("video_gif_trial", False)
+            ])
+    with open(path, "rb") as f:
+        await update.message.reply_document(f, filename="users.csv")
+
+# --- [SUPPORT SYSTEM] ---
+async def support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # unchanged from original
+    if update.message.reply_to_message and update.effective_user.id == ADMIN_ID:
+        msg_id = update.message.reply_to_message.message_id
+        if msg_id in support_messages:
+            uid = support_messages[msg_id]
+            await context.bot.send_message(chat_id=uid, text=f"📬 Admin reply:\n{update.message.text}")
+
+async def user_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # unchanged from original
     if update.effective_user.id == ADMIN_ID:
         return
     forwarded = await context.bot.send_message(
@@ -486,11 +772,17 @@ application.add_handler(CommandHandler("ban", ban))
 application.add_handler(CommandHandler("unban", unban))
 application.add_handler(CommandHandler("stats", stats))
 application.add_handler(CommandHandler("export", export))
+# Convert PDF from images
 application.add_handler(CommandHandler("convertpdf", lambda u, c: convert_pdf(u, c, False)))
+# Handle inline buttons
 application.add_handler(CallbackQueryHandler(handle_button))
+# Handle photos
 application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+# Handle support replies (admin replying to forwarded message)
 application.add_handler(MessageHandler(filters.TEXT & filters.REPLY, support_reply))
-application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(r'^https?://'), user_support))
+# Handle broadcast & text-to-PDF & user support & video links
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(r'^https?://'), handle_text))
+# Handle video links
 application.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^https?://'), handle_video))
 
 
