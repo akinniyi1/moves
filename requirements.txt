@@ -5,3 +5,7 @@ ffmpeg-python
 requests
 asyncpg
 pillow
+fpdf
+moviepy
+imageio
+imageio-ffmpeg
