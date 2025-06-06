@@ -174,22 +174,23 @@ async def convert_to_audio(update: Update, context: ContextTypes.DEFAULT_TYPE, f
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     downgrade_expired_users()
     user = update.effective_user
-    username = user.username
-    if username and username not in users:
-        # Initialize new user with trial flags
+    username = user.username or f"user_{user.id}"
+    user_id = user.id
+    if username not in users:
         users[username] = {
             "plan": "free",
             "downloads": 0,
             "banned": False,
             "text_pdf_trial": False,
-            "video_gif_trial": False
+            "video_gif_trial": False,
+            "user_id": user_id
         }
         save_users(users)
-
-    # Ban check
-    if username and users.get(username, {}).get("banned"):
+    else:
+        users[username]["user_id"] = user_id
+        save_users(users)
+    if users[username].get("banned"):
         return await update.message.reply_text("â›” You are banned from using this bot.")
-
     buttons = [
         [InlineKeyboardButton("ðŸ‘¤ View Profile", callback_data="profile"),
          InlineKeyboardButton("ðŸ–¼ï¸ Convert to PDF", callback_data="convertpdf_btn")],
@@ -197,13 +198,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("âœ‰ï¸ Text to PDF", callback_data="text_pdf")],
         [InlineKeyboardButton("ðŸ“£ Join Our Channel", url=CHANNEL_URL)]
     ]
-
-    # === NEW: Admin-only Broadcast Button ===
     if user.id == ADMIN_ID:
         buttons.append([InlineKeyboardButton("ðŸ“¢ Broadcast", callback_data="admin_broadcast")])
-
     await update.message.reply_text(
-        f"ðŸ‘‹ Hello @{username or user.first_name}!\n\n"
+        f"ðŸ‘‹ Hello @{username}!\nðŸ†” User ID: {user_id}\n\n"
         "This bot supports downloading videos from:\n"
         "âœ… Facebook, TikTok, Twitter, Instagram\n"
         "âŒ YouTube is not supported.\n\n"
@@ -211,9 +209,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send a supported video link to begin or use the menu below.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
-
-
-# --- [VIDEO HANDLER] ---
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     downgrade_expired_users()
     url = update.message.text.strip()
@@ -316,45 +311,13 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "profile":
         downgrade_expired_users()
-        user_id = str(query.from_user.id)
-        username = query.from_user.username or "NoUsername"
-
-        # Ensure user is stored with ID
-        if username not in users:
-            users[username] = {
-                "plan": "free",
-                "downloads": 0,
-                "banned": False,
-                "text_pdf_trial": False,
-                "video_gif_trial": False,
-                "id": user_id
-            }
-        else:
-            users[username]["id"] = user_id  # Always update
-
-        save_users(users)
-
-        user_data = users[username]
+        user_data = users.get(username, {"plan": "free"})
         if is_premium(user_data):
             exp_dt = datetime.fromisoformat(user_data["expires"])
-            msg = (
-                f"ðŸ‘¤ Username: @{username}
-"
-                f"ðŸ†” User ID: <code>{user_id}</code>
-"
-                f"ðŸ’¼ Plan: Premium
-"
-                f"â° Expires: {exp_dt.strftime('%Y-%m-%d %H:%M')} UTC"
-            )
+            msg = f"ðŸ‘¤ Username: @{username}\nðŸ’¼ Plan: Premium\nâ° Expires: {exp_dt.strftime('%Y-%m-%d %H:%M')} UTC"
         else:
-            msg = (
-                f"ðŸ‘¤ Username: @{username}
-"
-                f"ðŸ†” User ID: <code>{user_id}</code>
-"
-                f"ðŸ’¼ Plan: Free"
-            )
-        await query.message.reply_text(msg, parse_mode="HTML")
+            msg = f"ðŸ‘¤ Username: @{username}\nðŸ’¼ Plan: Free"
+        await query.message.reply_text(msg)
         return
 
     if data == "convertpdf_btn":
@@ -573,7 +536,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     # First, check if admin is awaiting broadcast
     if context.user_data.get("awaiting_broadcast"):
-        # Only ADMIN_ID can be here, but double-check
         if update.effective_user.id == ADMIN_ID:
             context.user_data["awaiting_broadcast"] = False
             message_text = update.message.text
@@ -581,16 +543,15 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for uname, data in users.items():
                 if data.get("banned"):
                     continue
-                try:
-                    await context.bot.send_message(chat_id=f"@{uname}", text=message_text)
-                    count += 1
-                    await asyncio.sleep(0.05)  # throttle
-                except:
-                    continue
+                chat_id = data.get("user_id")
+                if chat_id:
+                    try:
+                        await context.bot.send_message(chat_id=chat_id, text=message_text)
+                        count += 1
+                        await asyncio.sleep(0.05)
+                    except:
+                        pass
             return await update.message.reply_text(f"âœ… Broadcast sent to {count} users.")
-        else:
-            return await update.message.reply_text("â›” You are not authorized to broadcast.")
-
     # Next, check if user is awaiting text-to-PDF
     if context.user_data.get("awaiting_text_pdf"):
         context.user_data["awaiting_text_pdf"] = False
