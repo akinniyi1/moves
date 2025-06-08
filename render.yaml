@@ -2,8 +2,16 @@ services:
   - type: web
     name: telegram-social-video-bot
     env: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: |
+      apt-get update && apt-get install -y ffmpeg
+      pip install -r requirements.txt
     startCommand: python main.py
     envVars:
       - key: BOT_TOKEN
         value: 7767921269:AAFxOOGInLTmGcih2ERWeZubpDeHyBfzp8c
+      - key: NOWPAYMENTS_API_KEY
+        value: your_nowpayments_api_key_here
+      - key: NOWPAYMENTS_IPN_SECRET
+        value: your_ipn_secret_key_here
+      - key: RENDER_EXTERNAL_URL
+        value: https://your-app-name.onrender.com
