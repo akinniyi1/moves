@@ -101,7 +101,10 @@ def downgrade_expired_users():
                 continue
     save_users(users)
 
-async def delete_file_later(path, file_id=None):
+def delete_file_later(path, file_id=None):
+    return asyncio.create_task(_delete_file_after_delay(path, file_id))
+
+async def _delete_file_after_delay(path, file_id=None):
     await asyncio.sleep(60)
     if os.path.exists(path):
         os.remove(path)
@@ -209,6 +212,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send a supported video link to begin or use the menu below.",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
+
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     downgrade_expired_users()
     url = update.message.text.strip()
@@ -568,7 +572,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         max_width = 90
         for paragraph in text.split("\n"):
-"):
             lines = [paragraph[i:i+max_width] for i in range(0, len(paragraph), max_width)]
             for line in lines:
                 pdf.multi_cell(0, 10, line)
@@ -582,12 +585,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID and not update.message.text.startswith("/"):
         forwarded = await context.bot.send_message(
             ADMIN_ID,
-            f"📩 Message from @{update.effective_user.username}:
-
-{update.message.text}"
+            f"📩 Message from @{update.effective_user.username}:\n\n{update.message.text}"
         )
         support_messages[forwarded.message_id] = update.effective_user.id
         return await update.message.reply_text("✅ Message sent. You’ll get a reply soon.")
+
 
 # --- [VIDEO TO GIF HELPER] ---
 # (Already handled inline in handle_button under `gif:` callback_data)
