@@ -568,7 +568,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         max_width = 90
         for paragraph in text.split("\n"):
-"):
+
             lines = [paragraph[i:i+max_width] for i in range(0, len(paragraph), max_width)]
             for line in lines:
                 pdf.multi_cell(0, 10, line)
