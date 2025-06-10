@@ -265,8 +265,9 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_data["downloads"] += 1
             users[username] = user_data
             save_users(users)
-    except:
-        await status_msg.edit_text("⚠️ Download failed or file too large.")
+    except Exception as e:
+        # Only log the exception; do not send a warning for every download
+        logging.error(f"handle_video error: {e}")
 
 
 # --- [INLINE HANDLER] ---
@@ -574,7 +575,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pdf.set_font("Arial", size=12)
 
         max_width = 90
-        for paragraph in text.split("\n"):
+        for paragraph in re.split(r'\r?\n|\u2028|\u2029', text.strip()):
             lines = [paragraph[i:i+max_width] for i in range(0, len(paragraph), max_width)]
             for line in lines:
                 pdf.multi_cell(0, 10, line)
@@ -701,7 +702,6 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # --- [SUPPORT SYSTEM] ---
 async def support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # unchanged from original
     if update.message.reply_to_message and update.effective_user.id == ADMIN_ID:
         msg_id = update.message.reply_to_message.message_id
         if msg_id in support_messages:
@@ -709,7 +709,6 @@ async def support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=uid, text=f"📬 Admin reply:\n{update.message.text}")
 
 async def user_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # unchanged from original
     if update.effective_user.id == ADMIN_ID:
         return
     forwarded = await context.bot.send_message(
