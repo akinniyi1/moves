@@ -259,13 +259,19 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ])
             )
         file_registry[sent.message_id] = filename
-        asyncio.create_task(delete_file_later(filename, sent.message_id))
+        # Schedule deletion without nested create_task
+        delete_file_later(filename, sent.message_id)
         await status_msg.delete()
         if not is_premium(user_data):
             user_data["downloads"] += 1
             users[username] = user_data
             save_users(users)
     except Exception as e:
+        # Delete the "Downloading…" message if still present
+        try:
+            await status_msg.delete()
+        except:
+            pass
         # Only log the exception; do not send a warning for every download
         logging.error(f"handle_video error: {e}")
 
