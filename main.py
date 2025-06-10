@@ -394,9 +394,13 @@ async def convert_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, trigge
         pil_images[0].save(pdf_path, save_all=True, append_images=pil_images[1:])
         with open(pdf_path, 'rb') as f:
             await update.message.reply_document(f, filename="converted.pdf")
-        asyncio.create_task(delete_file_later(pdf_path))
+        # Schedule PDF deletion correctly (no extra create_task call)
+        delete_file_later(pdf_path)
+
+        # Remove each source image from disk
         for img in images:
             os.remove(img)
+        # Clear this user's in-memory image list
         image_collections[user_id] = []
     except:
         await update.message.reply_text("❌ Failed to generate PDF.")
@@ -532,7 +536,6 @@ async def user_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- [TEXT MESSAGE HANDLER] ---
-
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("awaiting_broadcast"):
         if update.effective_user.id == ADMIN_ID:
@@ -694,6 +697,7 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ])
     with open(path, "rb") as f:
         await update.message.reply_document(f, filename="users.csv")
+
 
 # --- [SUPPORT SYSTEM] ---
 async def support_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
